@@ -30,6 +30,7 @@ export const CodeExplorer: React.FC = () => {
     { id: 'models', label: 'Модели SQLAlchemy' },
     { id: 'middlewares', label: 'Middleware' },
     { id: 'prompts', label: 'Промпты' },
+    { id: 'locales', label: 'Локализация (i18n)' },
     { id: 'devops', label: 'Docker & Конфиг' },
     { id: 'tests', label: 'Тесты pytest' },
   ];

@@ -1,1271 +1,1414 @@
 import React, { useState, useRef, useEffect } from 'react';
 import {
   Send,
-  Mic,
   Paperclip,
+  Mic,
   Sparkles,
-  Bot,
-  User as UserIcon,
-  Check,
-  Clock,
-  BookOpen,
-  Calendar,
-  Share2,
-  FileText,
-  Volume2,
-  Image as ImageIcon,
-  Flame,
-  CheckCircle2,
-  X,
-  CreditCard,
-  Download,
   Brain,
-  HelpCircle
+  Clock,
+  Star,
+  Download,
+  ShieldAlert,
+  FileText,
+  Image as ImageIcon,
+  Check,
+  CheckCheck,
+  Radio,
+  Settings,
+  X,
+  Trash2,
+  HelpCircle,
+  UserCheck,
 } from 'lucide-react';
-import { UserProfile, ChatMessage, UserReminder, BotMode, Language } from '../types/index.ts';
+import { checkAndConsumeQuota, checkThrottle, type UserState } from '../utils/telegramLogic';
 
-interface Props {
-  user: UserProfile;
-  setUser: React.Dispatch<React.SetStateAction<UserProfile>>;
-  reminders: UserReminder[];
-  setReminders: React.Dispatch<React.SetStateAction<UserReminder[]>>;
-  memories: string[];
-  setMemories: React.Dispatch<React.SetStateAction<string[]>>;
-  onOpenAdmin: () => void;
+interface Message {
+  id: string;
+  role: 'user' | 'bot';
+  text: string;
+  timestamp: string;
+  isStreaming?: boolean;
+  inlineKeyboard?: { text: string; callback_data: string }[][];
+  isInvoice?: boolean;
+  isDocument?: { filename: string; content: string };
 }
 
-export const TelegramSimulator: React.FC<Props> = ({
-  user,
-  setUser,
-  reminders,
-  setReminders,
-  memories,
-  setMemories,
-  onOpenAdmin,
-}) => {
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+interface Reminder {
+  id: string;
+  title: string;
+  due_at: Date;
+  completed: boolean;
+}
+
+interface LiveBotStatus {
+  running: boolean;
+  botInfo: { id: number; username: string; first_name: string } | null;
+  lastError: string | null;
+  processedUpdates: number;
+  hasGeminiKey: boolean;
+}
+
+export function TelegramSimulator({ onOpenAdmin }: { onOpenAdmin?: () => void } = {}) {
+  // DB State
+  const [user, setUser] = useState({
+    id: 999999,
+    username: 'developer_admin',
+    language: 'ru',
+    tier: 'FREE' as 'FREE' | 'PRO',
+    active_mode: 'mentor',
+    daily_requests_count: 3,
+    last_request_date: new Date().toISOString(),
+  });
+
+  const [memories, setMemories] = useState<string[]>([
+    'Пользователь — разработчик из Алматы',
+    'Изучает архитектуру высоконагруженных систем',
+  ]);
+
+  const [reminders, setReminders] = useState<Reminder[]>([]);
+  const [messages, setMessages] = useState<Message[]>([
+    {
+      id: '1',
+      role: 'bot',
+      text: '👋 Привет! Я — **Sana AI**, твой персональный ИИ-ментор и коуч.\n\nЯ умею объяснять сложные темы, писать чистый код, анализировать PDF/DOCX/Фото, понимать голосовые сообщения и ставить умные напоминания (`/plan`).\n\nВыбери язык интерфейса или напиши любой вопрос:',
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      inlineKeyboard: [
+        [
+          { text: '🇷🇺 Русский', callback_data: 'set_lang:ru' },
+          { text: '🇰🇿 Қазақша', callback_data: 'set_lang:kk' },
+          { text: '🇬🇧 English', callback_data: 'set_lang:en' },
+        ],
+      ],
+    },
+  ]);
+
   const [inputText, setInputText] = useState('');
-  const [isBotTyping, setIsBotTyping] = useState(false);
-  const [isRecording, setIsRecording] = useState(false);
-  const [recordTimer, setRecordTimer] = useState(0);
-
-  // Modals & Panels
-  const [showStarsModal, setShowStarsModal] = useState(false);
-  const [showMemoryModal, setShowMemoryModal] = useState(false);
-  const [showRemindersModal, setShowRemindersModal] = useState(false);
-  const [showReferralModal, setShowReferralModal] = useState(false);
+  const [isTyping, setIsTyping] = useState(false);
   const [showAttachMenu, setShowAttachMenu] = useState(false);
-  const [newFactInput, setNewFactInput] = useState('');
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
 
-  const chatEndRef = useRef<HTMLDivElement>(null);
+  // Live Telegram Bot connection modal state
+  const [showConnectModal, setShowConnectModal] = useState(false);
+  const [botTokenInput, setBotTokenInput] = useState('');
+  const [geminiKeyInput, setGeminiKeyInput] = useState('');
+  const [isConnectingBot, setIsConnectingBot] = useState(false);
+  const [liveBotStatus, setLiveBotStatus] = useState<LiveBotStatus>({
+    running: false,
+    botInfo: null,
+    lastError: null,
+    processedUpdates: 0,
+    hasGeminiKey: false,
+  });
+
+  const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const photoInputRef = useRef<HTMLInputElement>(null);
+  const throttleCacheRef = useRef<Map<number, number>>(new Map());
 
-  // Auto-scroll chat to bottom
-  const scrollToBottom = () => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  const showToast = (msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => {
+      setToastMessage((prev) => (prev === msg ? null : prev));
+    }, 3500);
   };
 
+  // Scroll to bottom
   useEffect(() => {
-    scrollToBottom();
-  }, [messages, isBotTyping]);
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, isTyping]);
 
-  // Voice recording timer simulation
+  // Poll Live Bot status
   useEffect(() => {
-    let interval: any;
-    if (isRecording) {
-      interval = setInterval(() => {
-        setRecordTimer((prev) => prev + 1);
-      }, 1000);
-    } else {
-      setRecordTimer(0);
-    }
+    const fetchStatus = async () => {
+      try {
+        const res = await fetch('/api/telegram-bot/status');
+        if (res.ok) {
+          const data = await res.json();
+          setLiveBotStatus(data);
+        }
+      } catch {
+        // ignore offline errors
+      }
+    };
+    fetchStatus();
+    const interval = setInterval(fetchStatus, 5000);
     return () => clearInterval(interval);
-  }, [isRecording]);
-
-  // Initialize with onboarding if needed
-  useEffect(() => {
-    if (messages.length === 0) {
-      setMessages([
-        {
-          id: 'welcome_1',
-          role: 'model',
-          content: `👋 *Привет! Я Sana AI* — твой умный наставник и второй мозг для учёбы и работы.\n\nДавай настроим профиль за 3 быстрых шага, чтобы я давал максимально точные ответы.\n\n*Шаг 1 из 3:* Как к тебе обращаться?`,
-          timestamp: '10:00',
-          inlineButtons: [
-            { text: 'Димаш 👨‍🎓', data: 'set_name_Димаш' },
-            { text: 'Айгерим 👩‍💻', data: 'set_name_Айгерим' },
-            { text: 'Александр 💻', data: 'set_name_Александр' },
-          ],
-        },
-      ]);
-    }
   }, []);
 
-  // Format time HH:MM
-  const getCurrTime = () => {
-    const d = new Date();
-    return `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}`;
+  // Background APScheduler simulation for reminders
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const now = new Date();
+      setReminders((prev) =>
+        prev.map((rem) => {
+          if (!rem.completed && rem.due_at <= now) {
+            addBotMessage(`🔔 **НАПОМИНАНИЕ!**\n\nВы просили напомнить:\n📌 **${rem.title}**`);
+            return { ...rem, completed: true };
+          }
+          return rem;
+        })
+      );
+    }, 3000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const addBotMessage = (text: string, extra?: Partial<Message>) => {
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: Date.now().toString() + Math.random(),
+        role: 'bot',
+        text,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        ...extra,
+      },
+    ]);
   };
 
-  // Execute bot command or send message
-  const handleSendMessage = async (textToSend?: string) => {
-    const text = (textToSend || inputText).trim();
+  const addUserMessage = (text: string) => {
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: Date.now().toString() + Math.random(),
+        role: 'user',
+        text,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      },
+    ]);
+  };
+
+  const checkQuotaPrecondition = (): boolean => {
+    const state: UserState = {
+      tier: user.tier,
+      dailyRequestsCount: user.daily_requests_count,
+      lastRequestDate: new Date(user.last_request_date),
+    };
+    const result = checkAndConsumeQuota(state, new Date(), 20);
+    if (!result.allowed) {
+      addBotMessage(
+        '⚠️ Вы исчерпали дневной лимит бесплатных запросов (20/20).\n\nПерейдите на **Sana PRO** (/subscribe), чтобы получить безлимитный доступ к флагманской модели **Gemini 2.5 Pro**!'
+      );
+      return false;
+    }
+    return true;
+  };
+
+  const consumeQuotaOnSuccess = () => {
+    setUser((prev) => {
+      const state: UserState = {
+        tier: prev.tier,
+        dailyRequestsCount: prev.daily_requests_count,
+        lastRequestDate: new Date(prev.last_request_date),
+      };
+      const result = checkAndConsumeQuota(state, new Date(), 20);
+      return {
+        ...prev,
+        daily_requests_count: result.newState.dailyRequestsCount,
+        last_request_date: result.newState.lastRequestDate.toISOString(),
+      };
+    });
+  };
+
+  const handleConnectLiveBot = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsConnectingBot(true);
+    try {
+      const res = await fetch('/api/telegram-bot/connect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          botToken: botTokenInput.trim() || undefined,
+          geminiApiKey: geminiKeyInput.trim() || undefined,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        showToast(`⚠️ Ошибка: ${data.error || 'Не удалось подключить бота'}`);
+      } else {
+        setLiveBotStatus((prev) => ({
+          ...prev,
+          running: data.running,
+          botInfo: data.botInfo,
+          hasGeminiKey: data.hasGeminiKey,
+          lastError: null,
+        }));
+        showToast(
+          data.botInfo
+            ? `✅ Бот @${data.botInfo.username} успешно запущен в Telegram!`
+            : '✅ Настройки API успешно сохранены!'
+        );
+        setShowConnectModal(false);
+        setBotTokenInput('');
+        setGeminiKeyInput('');
+      }
+    } catch {
+      showToast('⚠️ Ошибка соединения с сервером');
+    } finally {
+      setIsConnectingBot(false);
+    }
+  };
+
+  const handleStopLiveBot = async () => {
+    await fetch('/api/telegram-bot/stop', { method: 'POST' });
+    setLiveBotStatus((prev) => ({ ...prev, running: false }));
+    showToast('⏹ Long-Polling Telegram-бота остановлен');
+  };
+
+  // Handle Commands & Text
+  const handleSend = async (textToSend?: string) => {
+    const text = (textToSend ?? inputText).trim();
     if (!text) return;
 
-    if (!textToSend) {
-      setInputText('');
+    // 1. Throttling Middleware Simulation (0.5s rate limit)
+    const throttleResult = checkThrottle(user.id, Date.now(), throttleCacheRef.current, 500);
+    if (throttleResult.throttled) {
+      showToast('⏳ Слишком много запросов! Подождите полсекунды.');
+      return;
     }
 
-    // Handle bot commands
+    if (!textToSend) setInputText('');
+    addUserMessage(text);
+
+    // 2. Command Routing
     if (text.startsWith('/')) {
-      handleBotCommand(text);
-      return;
-    }
+      const parts = text.split(' ');
+      const cmd = parts[0].toLowerCase();
 
-    // Check user quota
-    if (!user.isPro && user.queriesUsedToday >= user.dailyLimit && user.bonusQueries <= 0) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: String(Date.now()),
-          role: 'user',
-          content: text,
-          timestamp: getCurrTime(),
-        },
-        {
-          id: String(Date.now() + 1),
-          role: 'model',
-          content: `🛑 *Дневной лимит 20 запросов исчерпан!*\n\nЛимит обновится в 00:00 по твоему часовому поясу (${user.timezone}).\n\n✨ Пригласи друга по реферальной ссылке и получи **+10 бонусных запросов**, или подключи безлимитный **Sana Pro**!`,
-          timestamp: getCurrTime(),
-          inlineButtons: [
-            { text: '⭐ Подключить Sana Pro (100 Stars)', data: 'open_stars' },
-            { text: '🎁 Реферальная ссылка (+10)', data: 'open_referral' },
-          ],
-        },
-      ]);
-      return;
-    }
-
-    // Deduct query from quota
-    setUser((prev) => {
-      if (prev.isPro) return prev;
-      if (prev.queriesUsedToday < prev.dailyLimit) {
-        return { ...prev, queriesUsedToday: prev.queriesUsedToday + 1 };
+      if (cmd === '/start') {
+        setTimeout(() => {
+          addBotMessage(
+            '👋 Привет! Я — **Sana AI**, твой персональный ИИ-ментор.\n\nВыбери язык интерфейса или просто напиши свой вопрос:',
+            {
+              inlineKeyboard: [
+                [
+                  { text: '🇷🇺 Русский', callback_data: 'set_lang:ru' },
+                  { text: '🇰🇿 Қазақша', callback_data: 'set_lang:kk' },
+                  { text: '🇬🇧 English', callback_data: 'set_lang:en' },
+                ],
+              ],
+            }
+          );
+        }, 250);
+        return;
       }
-      return { ...prev, bonusQueries: Math.max(0, prev.bonusQueries - 1) };
-    });
 
-    // Check if natural reminder phrase: "напомни..."
-    if (text.toLowerCase().startsWith('напомни')) {
-      await handleNaturalReminder(text);
+      if (cmd === '/help') {
+        setTimeout(() => {
+          addBotMessage(
+            `📚 **Доступные команды Sana AI:**\n\n` +
+              `• \`/start\` — Перезапуск и выбор языка\n` +
+              `• \`/mode\` — Выбрать режим работы ИИ (Ментор, Кодер, Планировщик, Экзаменатор, Редактор)\n` +
+              `• \`/plan [текст]\` — Создать умное напоминание (напр. \`/plan Позвонить через 1 минуту\`)\n` +
+              `• \`/reminders\` — Список активных напоминаний\n` +
+              `• \`/memory\` — Посмотреть факты в долгосрочной памяти\n` +
+              `• \`/forget\` — Очистить долгосрочную память\n` +
+              `• \`/clear\` — Очистить контекст текущего диалога\n` +
+              `• \`/profile\` — Профиль и остаток дневных лимитов\n` +
+              `• \`/subscribe\` — Перейти на тариф Sana PRO\n` +
+              `• \`/export\` — Скачать историю диалогов в Markdown (.md)\n` +
+              `• \`/admin\` — Панель администратора`
+          );
+        }, 250);
+        return;
+      }
+
+      if (cmd === '/profile' || cmd === '/status') {
+        setTimeout(() => {
+          const limitStr = user.tier === 'PRO' ? '∞' : '20';
+          addBotMessage(
+            `👤 **Профиль пользователя Sana AI**\n\n` +
+              `🆔 ID: \`${user.id}\`\n` +
+              `💎 Тариф: **${user.tier}**\n` +
+              `📊 Запросов сегодня: **${user.daily_requests_count} / ${limitStr}**\n` +
+              `🎭 Активный режим: **${user.active_mode.toUpperCase()}**\n` +
+              `🌐 Язык: **${user.language.toUpperCase()}**`
+          );
+        }, 250);
+        return;
+      }
+
+      if (cmd === '/clear' || cmd === '/reset') {
+        setMessages([
+          {
+            id: Date.now().toString(),
+            role: 'bot',
+            text: '🧹 **Контекст текущего диалога очищен!**\nДолгосрочная память сохранена (посмотреть — `/memory`).',
+            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          },
+        ]);
+        return;
+      }
+
+      if (cmd === '/memory' || cmd === '/memories') {
+        setTimeout(() => {
+          if (memories.length === 0) {
+            addBotMessage(
+              '📭 В долгосрочной памяти пока нет записей.\nРасскажите мне о своих целях, профессии или интересах — я запомню это автоматически!'
+            );
+          } else {
+            const list = memories.map((m, idx) => `${idx + 1}. • ${m}`).join('\n');
+            addBotMessage(`🧠 **Долгосрочная память Sana AI (что я знаю о вас):**\n\n${list}`, {
+              inlineKeyboard: [[{ text: '🗑 Очистить память (/forget)', callback_data: 'clear_memories' }]],
+            });
+          }
+        }, 250);
+        return;
+      }
+
+      if (cmd === '/forget') {
+        setMemories([]);
+        setTimeout(() => {
+          addBotMessage('🗑 Долгосрочная память полностью очищена.');
+        }, 250);
+        return;
+      }
+
+      if (cmd === '/mode') {
+        const modes = [
+          { key: 'mentor', name: '🧠 Ментор (Socratic)' },
+          { key: 'coder', name: '💻 Программист (Senior Dev)' },
+          { key: 'planner', name: '📅 Планировщик (GTD)' },
+          { key: 'examiner', name: '🎓 Экзаменатор (Strict)' },
+          { key: 'editor', name: '✍️ Редактор (Copywriter)' },
+        ];
+        const keyboard = modes.map((m) => [
+          {
+            text: `${m.key === user.active_mode ? '✅ ' : ''}${m.name}`,
+            callback_data: `set_mode:${m.key}`,
+          },
+        ]);
+        setTimeout(() => {
+          addBotMessage('🎭 **Выберите режим работы Sana AI:**', { inlineKeyboard: keyboard });
+        }, 250);
+        return;
+      }
+
+      if (cmd === '/plan') {
+        const requestText = text.substring(5).trim();
+        if (!requestText) {
+          addBotMessage(
+            '📅 Пожалуйста, укажите задачу после команды.\nПример: `/plan Позвонить маме через 1 минуту`'
+          );
+          return;
+        }
+        setIsTyping(true);
+        try {
+          const res = await fetch('/api/parse-reminder', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: requestText, current_time: new Date().toISOString() }),
+          });
+          const data = await res.json();
+          setIsTyping(false);
+
+          if (data && data.title && data.due_at) {
+            const dueDate = new Date(data.due_at);
+            setReminders((prev) => [
+              ...prev,
+              { id: Date.now().toString(), title: data.title, due_at: dueDate, completed: false },
+            ]);
+            addBotMessage(
+              `✅ **Напоминание установлено!**\n\n📌 **Задача:** ${data.title}\n🕒 **Время:** ${dueDate.toLocaleTimeString()}`
+            );
+          } else {
+            addBotMessage('⚠️ Не удалось распознать время в вашем запросе. Попробуйте указать точнее.');
+          }
+        } catch {
+          setIsTyping(false);
+          addBotMessage('⚠️ Ошибка при создании напоминания.');
+        }
+        return;
+      }
+
+      if (cmd === '/reminders' || cmd === '/tasks') {
+        const active = reminders.filter((r) => !r.completed);
+        if (active.length === 0) {
+          addBotMessage('📭 У вас нет активных напоминаний.\nСоздайте задачу с помощью `/plan [текст]`');
+        } else {
+          const list = active
+            .map((r, i) => `${i + 1}. **${r.title}** — _${r.due_at.toLocaleTimeString()}_`)
+            .join('\n');
+          const kb = active.map((r) => [
+            { text: `✅ Выполнить: ${r.title.slice(0, 22)}`, callback_data: `rem_done:${r.id}` },
+            { text: '🗑 Удалить', callback_data: `rem_del:${r.id}` },
+          ]);
+          addBotMessage(`📋 **Ваши активные напоминания:**\n\n${list}`, { inlineKeyboard: kb });
+        }
+        return;
+      }
+
+      if (cmd === '/subscribe' || cmd === '/pro') {
+        if (user.tier === 'PRO') {
+          addBotMessage('🌟 У вас уже активирована подписка **Sana PRO**! Наслаждайтесь безлимитным общением.');
+          return;
+        }
+        setTimeout(() => {
+          addBotMessage(
+            '💎 **Подписка Sana PRO (1 месяц)**\n\nОткройте полный потенциал вашего ИИ-ментора:\n• Безлимитные запросы\n• Доступ к флагманской модели **Gemini 2.5 Pro**\n• Анализ больших PDF документов и аудио\n\nК оплате: **250 ⭐️ (Telegram Stars)**',
+            { isInvoice: true }
+          );
+        }, 250);
+        return;
+      }
+
+      if (cmd === '/admin') {
+        setTimeout(() => {
+          addBotMessage(
+            `📊 **Панель Администратора Sana AI**\n\n` +
+              `👥 Всего пользователей: **1,248**\n` +
+              `💎 Подписчиков PRO: **142**\n` +
+              `⏰ Активных напоминаний: **${reminders.filter((r) => !r.completed).length}**\n` +
+              `⭐️ Выручка (Stars): **35,500 XTR**\n\n` +
+              `Команды:\n` +
+              `• \`/grant_pro [user_id]\` — выдать PRO\n` +
+              `• \`/ban [user_id]\` — заблокировать\n` +
+              `• \`/broadcast [текст]\` — рассылка`
+          );
+        }, 250);
+        return;
+      }
+
+      if (cmd === '/grant_pro') {
+        setUser((prev) => ({ ...prev, tier: 'PRO' }));
+        addBotMessage(`✅ Пользователю \`${parts[1] || user.id}\` успешно выдан статус **PRO**!`);
+        return;
+      }
+
+      if (cmd === '/broadcast') {
+        const bText = text.replace(/^\/broadcast\s*/i, '').trim();
+        if (!bText) {
+          addBotMessage('Использование: `/broadcast Текст рассылки для всех пользователей`');
+          return;
+        }
+        addBotMessage(`✅ **Рассылка завершена!**\n📨 Доставлено: **1,248 пользователям**\nТекст: «${bText}»`);
+        return;
+      }
+
+      if (cmd === '/export') {
+        setTimeout(() => {
+          let md = `# 🧠 История диалогов с Sana AI\nДата экспорта: ${new Date().toISOString()}\n\n---\n\n`;
+          if (memories.length > 0) {
+            md += `## 📌 Долгосрочная память\n${memories.map((m) => `- ${m}`).join('\n')}\n\n---\n\n`;
+          }
+          messages.forEach((m) => {
+            const role = m.role === 'user' ? '👤 Вы' : '🤖 Sana AI';
+            md += `### ${role} (${m.timestamp})\n${m.text}\n\n---\n\n`;
+          });
+          addBotMessage('📄 Ваша полная история диалогов в формате Markdown готова к скачиванию.', {
+            isDocument: { filename: `sana_ai_history_${user.id}.md`, content: md },
+          });
+        }, 350);
+        return;
+      }
+
+      addBotMessage('⚠️ Неизвестная команда. Напишите `/help` для просмотра всех возможностей.');
       return;
     }
 
-    // Standard Chat with Gemini
-    const userMsg: ChatMessage = {
-      id: String(Date.now()),
-      role: 'user',
-      content: text,
-      timestamp: getCurrTime(),
-    };
+    // 3. Regular Dialog Message (with Quota Check & Streaming)
+    if (!checkQuotaPrecondition()) return;
 
-    setMessages((prev) => [...prev, userMsg]);
-    setIsBotTyping(true);
+    const botMsgId = (Date.now() + 1).toString();
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: botMsgId,
+        role: 'bot',
+        text: '⏳ _Sana думает..._',
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        isStreaming: true,
+      },
+    ]);
 
     try {
-      // Call server streaming API
+      const historyForApi = messages
+        .filter((m) => !m.isInvoice && !m.isDocument && !m.inlineKeyboard)
+        .slice(-15)
+        .map((m) => ({
+          role: m.role === 'user' ? 'user' : 'model',
+          content: m.text,
+        }));
+
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          messages: [...messages, userMsg].map((m) => ({ role: m.role, content: m.content })),
-          mode: user.mode,
+          message: text,
+          history: historyForApi,
+          memories,
+          mode: user.active_mode,
           language: user.language,
-          memories: memories,
-          userProfile: {
-            name: user.name,
-            studyGoal: user.studyGoal,
-            timezone: user.timezone,
-          },
+          tier: user.tier,
         }),
       });
 
-      if (!response.ok) {
-        throw new Error('API server error');
-      }
+      if (!response.body) throw new Error('No body');
 
-      const botMsgId = String(Date.now() + 1);
-      const botMsg: ChatMessage = {
-        id: botMsgId,
-        role: 'model',
-        content: '',
-        timestamp: getCurrTime(),
-        isStreaming: true,
-      };
-
-      setMessages((prev) => [...prev, botMsg]);
-
-      const reader = response.body?.getReader();
+      const reader = response.body.getReader();
       const decoder = new TextDecoder();
-      let accumulated = '';
+      let fullText = '';
+      let streamSuccess = false;
 
-      if (reader) {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-          const chunk = decoder.decode(value);
-          const lines = chunk.split('\n');
+        const chunk = decoder.decode(value);
+        const lines = chunk.split('\n');
 
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              try {
-                const parsed = JSON.parse(line.replace('data: ', '').trim());
-                if (parsed.text) {
-                  accumulated += parsed.text;
-                  setMessages((prev) =>
-                    prev.map((m) => (m.id === botMsgId ? { ...m, content: accumulated } : m))
-                  );
-                }
-                if (parsed.done) {
-                  setMessages((prev) =>
-                    prev.map((m) => (m.id === botMsgId ? { ...m, isStreaming: false } : m))
-                  );
-                }
-              } catch (e) {
-                // ignore SSE parse errors
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const dataStr = line.substring(6);
+            if (dataStr === '[DONE]') break;
+            try {
+              const data = JSON.parse(dataStr);
+              if (data.text) {
+                fullText += data.text;
+                streamSuccess = true;
+                setMessages((prev) =>
+                  prev.map((m) => (m.id === botMsgId ? { ...m, text: fullText + ' ▌' } : m))
+                );
               }
+            } catch {
+              // ignore partial JSON chunk
             }
           }
         }
       }
 
-      // Periodically trigger background fact extraction
-      if (messages.length > 0 && messages.length % 4 === 0) {
-        extractMemoriesSilently([...messages, userMsg]);
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === botMsgId ? { ...m, text: fullText || 'Ответ получен.', isStreaming: false } : m
+        )
+      );
+
+      if (streamSuccess) {
+        consumeQuotaOnSuccess();
+
+        // Trigger Background Memory Extraction
+        fetch('/api/extract-memory', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ user_message: text, bot_response: fullText }),
+        })
+          .then((r) => r.json())
+          .then((data) => {
+            if (data.facts && Array.isArray(data.facts) && data.facts.length > 0) {
+              setMemories((prev) => Array.from(new Set([...prev, ...data.facts])));
+            }
+          })
+          .catch(() => {});
       }
-    } catch (err: any) {
-      console.error(err);
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: String(Date.now() + 2),
-          role: 'model',
-          content: '⚠️ Не удалось связаться с сервером Sana AI. Пожалуйста, проверьте подключение.',
-          timestamp: getCurrTime(),
-        },
-      ]);
-    } finally {
-      setIsBotTyping(false);
+    } catch {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === botMsgId
+            ? {
+                ...m,
+                text: '⚠️ Произошла ошибка при генерации ответа. Ваша квота не была списана.',
+                isStreaming: false,
+              }
+            : m
+        )
+      );
     }
   };
 
-  // Background memory extractor
-  const extractMemoriesSilently = async (allMsgs: ChatMessage[]) => {
+  // Handle Inline Keyboard Callbacks
+  const handleCallback = (data: string, msgId: string) => {
+    if (data.startsWith('set_lang:')) {
+      const lang = data.split(':')[1];
+      setUser((prev) => ({ ...prev, language: lang }));
+      const langMap: Record<string, string> = {
+        ru: '🇷🇺 Язык успешно изменён на Русский! Напишите свой вопрос или используйте `/mode`.',
+        kk: '🇰🇿 Тіл Қазақшаға сәтті ауыстырылды! Сұрағыңызды жазыңыз немесе `/mode` таңдаңыз.',
+        en: '🇬🇧 Language switched to English! Ask me anything or use `/mode`.',
+      };
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === msgId ? { ...m, text: langMap[lang], inlineKeyboard: undefined } : m
+        )
+      );
+    } else if (data.startsWith('set_mode:')) {
+      const mode = data.split(':')[1];
+      setUser((prev) => ({ ...prev, active_mode: mode }));
+      const modes = [
+        { key: 'mentor', name: '🧠 Ментор (Socratic)' },
+        { key: 'coder', name: '💻 Программист (Senior Dev)' },
+        { key: 'planner', name: '📅 Планировщик (GTD)' },
+        { key: 'examiner', name: '🎓 Экзаменатор (Strict)' },
+        { key: 'editor', name: '✍️ Редактор (Copywriter)' },
+      ];
+      const keyboard = modes.map((m) => [
+        { text: `${m.key === mode ? '✅ ' : ''}${m.name}`, callback_data: `set_mode:${m.key}` },
+      ]);
+      const modeName = modes.find((m) => m.key === mode)?.name;
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === msgId
+            ? { ...m, text: `✅ Активный режим изменён на: **${modeName}**`, inlineKeyboard: keyboard }
+            : m
+        )
+      );
+    } else if (data === 'clear_memories') {
+      setMemories([]);
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === msgId
+            ? { ...m, text: '🗑 Долгосрочная память полностью очищена.', inlineKeyboard: undefined }
+            : m
+        )
+      );
+    } else if (data.startsWith('rem_done:')) {
+      const remId = data.split(':')[1];
+      setReminders((prev) => prev.map((r) => (r.id === remId ? { ...r, completed: true } : r)));
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === msgId
+            ? { ...m, text: '✅ Задача отмечена выполненной!', inlineKeyboard: undefined }
+            : m
+        )
+      );
+    } else if (data.startsWith('rem_del:')) {
+      const remId = data.split(':')[1];
+      setReminders((prev) => prev.filter((r) => r.id !== remId));
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === msgId ? { ...m, text: '🗑 Напоминание удалено.', inlineKeyboard: undefined } : m
+        )
+      );
+    }
+  };
+
+  // Handle Real File Upload
+  const handleRealFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setShowAttachMenu(false);
+
+    if (!checkQuotaPrecondition()) return;
+
+    addUserMessage(`📎 [Файл: ${file.name}] Проанализируй содержимое и выдели главное.`);
+    const botMsgId = Date.now().toString();
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: botMsgId,
+        role: 'bot',
+        text: `📥 _Читаю и анализирую файл «${file.name}»..._`,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      },
+    ]);
+
     try {
-      const res = await fetch('/api/extract-memory', {
+      const isText =
+        file.type.startsWith('text/') ||
+        /\.(txt|md|py|js|ts|tsx|json|csv)$/i.test(file.name);
+
+      let textContent = '';
+      let base64 = '';
+
+      if (isText) {
+        textContent = await file.text();
+      } else {
+        const buf = await file.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        let binary = '';
+        for (let i = 0; i < bytes.byteLength; i++) {
+          binary += String.fromCharCode(bytes[i]);
+        }
+        base64 = btoa(binary);
+      }
+
+      const res = await fetch('/api/analyze-media', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          conversation: allMsgs.slice(-6).map((m) => `${m.role}: ${m.content}`),
+          file_name: file.name,
+          mime_type: file.type || 'application/octet-stream',
+          file_base64: base64 || undefined,
+          text_content: textContent || undefined,
+          prompt: `Проанализируй файл ${file.name} и составь структурированное резюме.`,
+          tier: user.tier,
         }),
       });
       const data = await res.json();
-      if (data.facts && Array.isArray(data.facts) && data.facts.length > 0) {
-        setMemories((prev) => Array.from(new Set([...prev, ...data.facts])));
-      }
-    } catch (e) {
-      // silent background fail
-    }
-  };
-
-  // Natural reminder parser
-  const handleNaturalReminder = async (text: string) => {
-    const userMsg: ChatMessage = {
-      id: String(Date.now()),
-      role: 'user',
-      content: text,
-      timestamp: getCurrTime(),
-    };
-    setMessages((prev) => [...prev, userMsg]);
-    setIsBotTyping(true);
-
-    try {
-      const res = await fetch('/api/parse-reminder', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, timezone: user.timezone }),
-      });
-      const data = await res.json();
-
-      if (data.title && data.datetime_iso) {
-        const newRem: UserReminder = {
-          id: String(Date.now()),
-          title: data.title,
-          datetimeIso: data.datetime_iso,
-          isCompleted: false,
-        };
-        setReminders((prev) => [newRem, ...prev]);
-
-        const formattedDate = new Date(data.datetime_iso).toLocaleString('ru-RU', {
-          day: 'numeric',
-          month: 'long',
-          hour: '2-digit',
-          minute: '2-digit',
-        });
-
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: String(Date.now() + 1),
-            role: 'model',
-            content: `✅ *Напоминание успешно создано!*\n\n📌 **Задача:** ${data.title}\n⏰ **Время:** ${formattedDate} (${user.timezone})\n\nЯ пришлю уведомление вовремя. Список всех задач: /reminders`,
-            timestamp: getCurrTime(),
-          },
-        ]);
-      } else {
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: String(Date.now() + 1),
-            role: 'model',
-            content: `Пожалуйста, укажи точнее время и дату события. Например:\n\n_«Напомни завтра в 14:00 сдать реферат по экономике»_`,
-            timestamp: getCurrTime(),
-          },
-        ]);
-      }
-    } catch (e) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: String(Date.now() + 1),
-          role: 'model',
-          content: 'Ошибка при сохранении напоминания. Попробуйте еще раз.',
-          timestamp: getCurrTime(),
-        },
-      ]);
+      consumeQuotaOnSuccess();
+      setMessages((prev) =>
+        prev.map((m) => (m.id === botMsgId ? { ...m, text: data.text || 'Анализ завершён.' } : m))
+      );
+    } catch {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === botMsgId ? { ...m, text: '⚠️ Ошибка при анализе файла.' } : m
+        )
+      );
     } finally {
-      setIsBotTyping(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
     }
   };
 
-  // Bot commands dispatcher
-  const handleBotCommand = (cmd: string) => {
-    const userMsg: ChatMessage = {
-      id: String(Date.now()),
-      role: 'user',
-      content: cmd,
-      timestamp: getCurrTime(),
-    };
-
-    const cleanCmd = cmd.toLowerCase().trim();
-
-    if (cleanCmd === '/start') {
-      setUser((prev) => ({ ...prev, onboardingStep: 1 }));
-      setMessages((prev) => [
-        ...prev,
-        userMsg,
-        {
-          id: String(Date.now() + 1),
-          role: 'model',
-          content: `👋 *Привет! Я Sana AI* — твой умный наставник и второй мозг для учёбы и работы.\n\nДавай настроим профиль за 3 быстрых шага:\n\n*Шаг 1 из 3:* Как к тебе обращаться?`,
-          timestamp: getCurrTime(),
-          inlineButtons: [
-            { text: 'Димаш 👨‍🎓', data: 'set_name_Димаш' },
-            { text: 'Айгерим 👩‍💻', data: 'set_name_Айгерим' },
-            { text: 'Александр 💻', data: 'set_name_Александр' },
-          ],
-        },
-      ]);
-    } else if (cleanCmd === '/mode') {
-      setMessages((prev) => [
-        ...prev,
-        userMsg,
-        {
-          id: String(Date.now() + 1),
-          role: 'model',
-          content: `🧭 *Выберите рабочий режим Sana AI:*\n\nКаждый режим меняет системные инструкции и методику общения с вами:`,
-          timestamp: getCurrTime(),
-          inlineButtons: [
-            { text: '🎓 Наставник', data: 'mode_mentor' },
-            { text: '✍️ Редактор текстов', data: 'mode_editor' },
-            { text: '📅 Планировщик', data: 'mode_planner' },
-            { text: '📝 Экзаменатор', data: 'mode_examiner' },
-            { text: '💻 Кодер', data: 'mode_coder' },
-          ],
-        },
-      ]);
-    } else if (cleanCmd === '/plan' || cleanCmd === '/upgrade') {
-      setShowStarsModal(true);
-      setMessages((prev) => [
-        ...prev,
-        userMsg,
-        {
-          id: String(Date.now() + 1),
-          role: 'model',
-          content: `⭐ *Тарифные планы Sana AI*\n\nТвой текущий статус: **${user.isPro ? 'Sana Pro (Активен)' : 'Free план'}**\n\n• **Free:** 20 запросов в день, модель Flash\n• **Sana Pro (100 Stars / 990 ₸ / 1900 ₽):** Безлимит, модель Pro, файлы до 50 МБ, приоритет!`,
-          timestamp: getCurrTime(),
-          inlineButtons: [
-            { text: '⭐ Подключить Pro за 100 Stars', data: 'open_stars' },
-            { text: '🎁 Реферальная ссылка (+10)', data: 'open_referral' },
-          ],
-        },
-      ]);
-    } else if (cleanCmd === '/reminders') {
-      setShowRemindersModal(true);
-      setMessages((prev) => [
-        ...prev,
-        userMsg,
-        {
-          id: String(Date.now() + 1),
-          role: 'model',
-          content: `📋 Открываю список твоих активных напоминаний (${reminders.length} запланировано).`,
-          timestamp: getCurrTime(),
-        },
-      ]);
-    } else if (cleanCmd === '/export') {
-      exportDialogAsMarkdown();
-    } else if (cleanCmd === '/admin') {
-      onOpenAdmin();
-    } else {
-      setMessages((prev) => [
-        ...prev,
-        userMsg,
-        {
-          id: String(Date.now() + 1),
-          role: 'model',
-          content: `Команда не распознана. Доступные команды:\n• /start — перезапустить онбординг\n• /mode — сменить режим работы\n• /plan или /upgrade — тарифы и подписка\n• /reminders — список напоминаний\n• /export — скачать историю диалога\n• /admin — админ-панель`,
-          timestamp: getCurrTime(),
-        },
-      ]);
-    }
-  };
-
-  // Handle inline buttons clicks
-  const handleInlineClick = async (actionData: string) => {
-    if (actionData.startsWith('set_name_')) {
-      const selectedName = actionData.replace('set_name_', '');
-      setUser((prev) => ({ ...prev, name: selectedName, onboardingStep: 2 }));
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: String(Date.now()),
-          role: 'user',
-          content: `Мое имя: ${selectedName}`,
-          timestamp: getCurrTime(),
-        },
-        {
-          id: String(Date.now() + 1),
-          role: 'model',
-          content: `Отлично, ${selectedName}! 🎯\n\n*Шаг 2 из 3:* Какая твоя главная цель сейчас?`,
-          timestamp: getCurrTime(),
-          inlineButtons: [
-            { text: '🎓 Сдать сессию / экзамены', data: 'set_goal_exams' },
-            { text: '💻 Научиться программировать', data: 'set_goal_coding' },
-            { text: '💼 Работа и фриланс', data: 'set_goal_freelance' },
-            { text: '⚡ Личная продуктивность', data: 'set_goal_productivity' },
-          ],
-        },
-      ]);
-    } else if (actionData.startsWith('set_goal_')) {
-      const goalMap: Record<string, string> = {
-        set_goal_exams: 'Сдать экзамены и сессию',
-        set_goal_coding: 'Изучить IT и программирование',
-        set_goal_freelance: 'Работа и карьера на фрилансе',
-        set_goal_productivity: 'Личная продуктивность и тайм-менеджмент',
-      };
-      const goal = goalMap[actionData] || 'Учёба';
-      setUser((prev) => ({ ...prev, studyGoal: goal, onboardingStep: 3 }));
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: String(Date.now()),
-          role: 'user',
-          content: `Цель: ${goal}`,
-          timestamp: getCurrTime(),
-        },
-        {
-          id: String(Date.now() + 1),
-          role: 'model',
-          content: `Запомнил цель: *${goal}*! ⏰\n\n*Шаг 3 из 3:* Выбери свой часовой пояс (нужен для точных напоминаний):`,
-          timestamp: getCurrTime(),
-          inlineButtons: [
-            { text: '🇰🇿 Алматы / Астана (UTC+5)', data: 'set_tz_Asia/Almaty' },
-            { text: '🇷🇺 Москва / СПб (UTC+3)', data: 'set_tz_Europe/Moscow' },
-            { text: '🇺🇿 Ташкент (UTC+5)', data: 'set_tz_Asia/Tashkent' },
-            { text: '🇦🇲 Ереван / Тбилиси (UTC+4)', data: 'set_tz_Asia/Yerevan' },
-          ],
-        },
-      ]);
-    } else if (actionData.startsWith('set_tz_')) {
-      const tz = actionData.replace('set_tz_', '');
-      setUser((prev) => ({ ...prev, timezone: tz, onboardingStep: 4 }));
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: String(Date.now()),
-          role: 'user',
-          content: `Часовой пояс: ${tz}`,
-          timestamp: getCurrTime(),
-        },
-        {
-          id: String(Date.now() + 1),
-          role: 'model',
-          content: `🎉 *Настройка профиля успешно завершена!*\n\n• Твой тариф: **Free** (20 запросов в день)\n• Текущий режим: **Наставник 🎓**\n• Часовой пояс: **${tz}**\n\n💡 *Что можно сделать прямо сейчас:*\n1. Отправь фото задачи или конспекта — разберу по шагам\n2. Напиши «Напомни завтра в 10:00 сдать курсовую»\n3. Загрузи документ (PDF, DOCX) для конспекта и теста\n4. Задай любой вопрос по учёбе или коду!`,
-          timestamp: getCurrTime(),
-          inlineButtons: [
-            { text: '🧭 Выбрать режим (/mode)', data: 'cmd_mode' },
-            { text: '🎁 Моя реферальная ссылка', data: 'open_referral' },
-          ],
-        },
-      ]);
-    } else if (actionData.startsWith('mode_')) {
-      const newMode = actionData.replace('mode_', '') as BotMode;
-      const modeNames: Record<BotMode, string> = {
-        mentor: 'Наставник 🎓',
-        editor: 'Редактор текстов ✍️',
-        planner: 'Планировщик 📅',
-        examiner: 'Экзаменатор 📝',
-        coder: 'Кодер 💻',
-      };
-      setUser((prev) => ({ ...prev, mode: newMode }));
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: String(Date.now()),
-          role: 'user',
-          content: `/mode ${newMode}`,
-          timestamp: getCurrTime(),
-        },
-        {
-          id: String(Date.now() + 1),
-          role: 'model',
-          content: `✨ Режим переключен на **${modeNames[newMode]}**!\n\nГотов к работе. Чем могу помочь прямо сейчас?`,
-          timestamp: getCurrTime(),
-        },
-      ]);
-    } else if (actionData === 'open_stars') {
-      setShowStarsModal(true);
-    } else if (actionData === 'open_referral') {
-      setShowReferralModal(true);
-    } else if (actionData === 'cmd_mode') {
-      handleBotCommand('/mode');
-    }
-  };
-
-  // Simulate Voice message recording and Gemini transcription
-  const handleToggleVoiceRecording = async () => {
-    if (!isRecording) {
-      setIsRecording(true);
-    } else {
-      setIsRecording(false);
-      // Simulate transcribing voice audio
-      setIsBotTyping(true);
-
-      const sampleVoiceQueries = [
-        'Привет, Sana! Объясни простыми словами, что такое нормализация баз данных и 3 нормальная форма?',
-        'Как мне подготовиться к экзамену по матанализу за три дня, если я ничего не помню?',
-        'Помоги составить план для диплома по теме разработка телеграм ботов на Python aiogram.',
-      ];
-      const randomTranscription = sampleVoiceQueries[Math.floor(Math.random() * sampleVoiceQueries.length)];
-
-      const voiceMsg: ChatMessage = {
-        id: String(Date.now()),
-        role: 'user',
-        content: `🎙️ _Голосовое сообщение (0:0${Math.max(3, recordTimer)} с)_`,
-        timestamp: getCurrTime(),
-        attachment: {
-          type: 'voice',
-          name: 'voice_note.ogg',
-          transcription: randomTranscription,
-        },
-      };
-
-      setMessages((prev) => [...prev, voiceMsg]);
-
-      // Call Gemini for answering the transcribed voice text
-      await handleSendMessage(randomTranscription);
-    }
-  };
-
-  // Document analysis simulation (PDF/DOCX/TXT)
-  const handleAnalyzeDocumentSample = async (sampleName: string, text: string) => {
+  // Simulate Demo Media Uploads
+  const simulateMedia = async (type: 'pdf' | 'photo' | 'voice') => {
     setShowAttachMenu(false);
-    setIsBotTyping(true);
+    if (!checkQuotaPrecondition()) return;
 
-    const docMsg: ChatMessage = {
-      id: String(Date.now()),
-      role: 'user',
-      content: `📎 Отправлен документ: **${sampleName}** (разбор и тест)`,
-      timestamp: getCurrTime(),
-      attachment: {
-        type: 'file',
-        name: sampleName,
-      },
-    };
-
-    setMessages((prev) => [...prev, docMsg]);
-
-    try {
-      const res = await fetch('/api/analyze-doc', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fileName: sampleName, docText: text }),
-      });
-      const data = await res.json();
-
+    if (type === 'pdf') {
+      addUserMessage('📄 [Документ: architecture_spec.pdf]\nСделай резюме этого документа.');
+      const botMsgId = Date.now().toString();
       setMessages((prev) => [
         ...prev,
         {
-          id: String(Date.now() + 1),
-          role: 'model',
-          content: data.analysis || 'Не удалось сформировать разбор документа.',
-          timestamp: getCurrTime(),
+          id: botMsgId,
+          role: 'bot',
+          text: '📥 _Загружаю и анализирую PDF документ (в ThreadPoolExecutor)..._',
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         },
       ]);
-    } catch (e) {
+
+      setTimeout(async () => {
+        await handleSend(
+          'Проанализируй следующий текст из PDF документа и сделай краткое резюме: "Sana AI — это мультимодальный бот на базе Gemini 2.5 и aiogram 3.x. Он использует асинхронный SQLAlchemy 2.0 для работы с PostgreSQL и Redis для FSM-состояний и троттлинга. Главная цель — помочь пользователю учиться через сократовский метод."'
+        );
+        setMessages((prev) => prev.filter((m) => m.id !== botMsgId));
+      }, 900);
+    } else if (type === 'photo') {
+      addUserMessage('🖼 [Фото: math_equation.jpg]\nОбъясни, как решить это уравнение.');
+      setTimeout(() => {
+        handleSend(
+          'Пользователь прислал фото с квадратным уравнением: x^2 - 5x + 6 = 0. Объясни пошагово, как его решить через дискриминант и теорему Виета.'
+        );
+      }, 400);
+    } else if (type === 'voice') {
+      addUserMessage('🎙 [Голосовое сообщение: 0:12]');
+      const botMsgId = Date.now().toString();
       setMessages((prev) => [
         ...prev,
         {
-          id: String(Date.now() + 1),
-          role: 'model',
-          content: 'Ошибка анализа документа.',
-          timestamp: getCurrTime(),
+          id: botMsgId,
+          role: 'bot',
+          text: '🎙 _Слушаю и транскрибирую голосовое сообщение..._',
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         },
       ]);
-    } finally {
-      setIsBotTyping(false);
+
+      setTimeout(() => {
+        const transcription =
+          'Привет, Сана! Расскажи кратко, в чём разница между процессами и потоками в операционных системах?';
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === botMsgId ? { ...m, text: `🎙 **Вы сказали:**\n_"${transcription}"_` } : m
+          )
+        );
+        handleSend(transcription);
+      }, 1100);
     }
   };
 
-  // Photo / Vision analysis
-  const handleAnalyzePhotoSample = async (sampleTitle: string, promptText: string) => {
-    setShowAttachMenu(false);
-    setIsBotTyping(true);
-
-    const photoMsg: ChatMessage = {
-      id: String(Date.now()),
-      role: 'user',
-      content: `📷 Отправлено фото: **${sampleTitle}**\n_${promptText}_`,
-      timestamp: getCurrTime(),
-      attachment: {
-        type: 'image',
-        name: sampleTitle,
-      },
-    };
-
-    setMessages((prev) => [...prev, photoMsg]);
-
-    await handleSendMessage(`Проанализируй конспект/задачу на фото "${sampleTitle}": ${promptText}. Реши задачу пошагово, объясняя каждое действие.`);
+  const handlePayInvoice = (msgId: string) => {
+    setUser((prev) => ({ ...prev, tier: 'PRO' }));
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === msgId ? { ...m, isInvoice: false, text: m.text + '\n\n✅ **ОПЛАЧЕНО (250 XTR)**' } : m
+      )
+    );
+    addBotMessage(
+      '🎉 **Оплата прошла успешно!**\n\nДобро пожаловать в **Sana PRO**! Теперь вам доступны безлимитные запросы и флагманская модель **Gemini 2.5 Pro**.'
+    );
   };
 
-  // Export conversation as Markdown
-  const exportDialogAsMarkdown = () => {
-    let md = `# Sana AI — Экспорт диалога\n\n`;
-    md += `Пользователь: ${user.name} | Цель: ${user.studyGoal} | Часовой пояс: ${user.timezone}\n`;
-    md += `Дата экспорта: ${new Date().toLocaleString()}\n\n---\n\n`;
+  const renderFormattedText = (text: string) => {
+    // Rich markdown renderer supporting code blocks, bold, italic, inline code, spoilers
+    const parts = text.split(/(```[\s\S]*?```)/g);
+    return parts.map((part, idx) => {
+      if (part.startsWith('```') && part.endsWith('```')) {
+        const lines = part.slice(3, -3).trim().split('\n');
+        const firstLine = lines[0]?.trim() || '';
+        const hasLang = /^[a-zA-Z0-9_-]+$/.test(firstLine);
+        const codeContent = hasLang ? lines.slice(1).join('\n') : lines.join('\n');
+        return (
+          <pre
+            key={idx}
+            className="my-2 p-2.5 bg-[#0e1621] text-emerald-300 rounded-lg overflow-x-auto text-xs font-mono border border-slate-700/60"
+          >
+            <code>{codeContent}</code>
+          </pre>
+        );
+      }
 
-    for (const m of messages) {
-      const author = m.role === 'user' ? '👤 Пользователь' : '🧠 Sana AI';
-      md += `### ${author} (${m.timestamp})\n${m.content}\n\n`;
-    }
-
-    const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `sana_ai_dialog_${Date.now()}.md`;
-    a.click();
-    URL.revokeObjectURL(url);
-
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: String(Date.now()),
-        role: 'model',
-        content: `📄 *Файл с историей диалога успешно экспортирован!*\n\nЗагрузка файла .md началась на твоем устройстве.`,
-        timestamp: getCurrTime(),
-      },
-    ]);
+      return (
+        <span key={idx} className="whitespace-pre-wrap">
+          {part.split('\n').map((line, i, arr) => (
+            <React.Fragment key={i}>
+              {line.split(/(\*\*.*?\*\*|`.*?`|\|\|.*?\|\||_.*?_)/g).map((seg, j) => {
+                if (seg.startsWith('**') && seg.endsWith('**')) {
+                  return (
+                    <strong key={j} className="font-bold text-white">
+                      {seg.slice(2, -2)}
+                    </strong>
+                  );
+                }
+                if (seg.startsWith('`') && seg.endsWith('`')) {
+                  return (
+                    <code
+                      key={j}
+                      className="px-1.5 py-0.5 bg-black/30 text-indigo-200 rounded text-xs font-mono"
+                    >
+                      {seg.slice(1, -1)}
+                    </code>
+                  );
+                }
+                if (seg.startsWith('||') && seg.endsWith('||')) {
+                  return (
+                    <span
+                      key={j}
+                      title="Наведите, чтобы увидеть спойлер"
+                      className="bg-slate-600 text-transparent hover:bg-slate-700/60 hover:text-slate-100 rounded px-1 transition-colors cursor-pointer"
+                    >
+                      {seg.slice(2, -2)}
+                    </span>
+                  );
+                }
+                if (seg.startsWith('_') && seg.endsWith('_') && seg.length > 2) {
+                  return (
+                    <em key={j} className="italic text-slate-300">
+                      {seg.slice(1, -1)}
+                    </em>
+                  );
+                }
+                return seg;
+              })}
+              {i < arr.length - 1 && <br />}
+            </React.Fragment>
+          ))}
+        </span>
+      );
+    });
   };
-
-  // Activate Pro subscription via Telegram Stars
-  const handleConfirmStarsPayment = () => {
-    setUser((prev) => ({
-      ...prev,
-      isPro: true,
-      dailyLimit: 999999,
-    }));
-    setShowStarsModal(false);
-
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: String(Date.now()),
-        role: 'model',
-        content: `🎉 *Поздравляем! Подписка Sana Pro активирована за 100 Telegram Stars!*\n\n⭐ Безлимитные запросы без счетчика\n🚀 Модель Gemini Pro с глубоким рассуждением\n📁 Загрузка документов до 50 МБ\n⚡ Приоритетная скорость ответов\n\nСпасибо за поддержку Sana AI!`,
-        timestamp: getCurrTime(),
-      },
-    ]);
-  };
-
-  const modeBadge = {
-    mentor: { title: 'Наставник', icon: '🎓', color: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30' },
-    editor: { title: 'Редактор', icon: '✍️', color: 'bg-amber-500/20 text-amber-400 border-amber-500/30' },
-    planner: { title: 'Планировщик', icon: '📅', color: 'bg-blue-500/20 text-blue-400 border-blue-500/30' },
-    examiner: { title: 'Экзаменатор', icon: '📝', color: 'bg-purple-500/20 text-purple-400 border-purple-500/30' },
-    coder: { title: 'Кодер', icon: '💻', color: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30' },
-  }[user.mode];
 
   return (
-    <div className="flex h-full w-full bg-[#0e1621] text-slate-100 antialiased overflow-hidden select-none">
-      {/* Main Telegram Chat Window */}
-      <div className="flex flex-col flex-1 h-full min-w-0 bg-[#0f141c]">
-        {/* Top Header */}
-        <header className="h-16 px-3 sm:px-4 bg-[#17212b] border-b border-slate-800 flex items-center justify-between z-10 shadow-sm shrink-0 gap-2">
-          <div className="flex items-center gap-2.5 min-w-0">
-            <div className="relative shrink-0">
-              <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-full bg-gradient-to-tr from-cyan-600 to-blue-500 flex items-center justify-center text-white font-bold text-base sm:text-lg shadow-md">
+    <div className="flex h-full w-full bg-slate-950 overflow-hidden relative">
+      {/* Toast Notification */}
+      {toastMessage && (
+        <div className="fixed top-4 right-4 z-50 bg-slate-900 border border-indigo-500/40 text-white px-4 py-2.5 rounded-xl shadow-2xl flex items-center gap-2 text-sm animate-in fade-in slide-in-from-top-2">
+          <span>{toastMessage}</span>
+        </div>
+      )}
+
+      {/* Connect Real Telegram Bot Modal */}
+      {showConnectModal && (
+        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-6 shadow-2xl">
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-indigo-500/10 border border-indigo-500/30 flex items-center justify-center text-indigo-400">
+                  <Radio className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-white">Подключить реального Telegram-бота</h3>
+                  <p className="text-xs text-slate-400">Запуск живого Long-Polling прямо с этого сервера</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowConnectModal(false)}
+                className="text-slate-400 hover:text-white p-1"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {liveBotStatus.running && liveBotStatus.botInfo && (
+              <div className="mb-4 p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-between">
+                <div className="text-xs">
+                  <div className="font-bold text-emerald-400 flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                    Активен: @{liveBotStatus.botInfo.username}
+                  </div>
+                  <div className="text-slate-400 mt-0.5">
+                    Обработано событий: {liveBotStatus.processedUpdates}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleStopLiveBot}
+                  className="px-2.5 py-1 bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 rounded-lg text-xs font-medium transition-colors"
+                >
+                  Остановить
+                </button>
+              </div>
+            )}
+
+            <form onSubmit={handleConnectLiveBot} className="space-y-4">
+              <div>
+                <label className="block text-xs font-semibold text-slate-300 mb-1">
+                  Telegram Bot Token (от @BotFather)
+                </label>
+                <input
+                  type="password"
+                  value={botTokenInput}
+                  onChange={(e) => setBotTokenInput(e.target.value)}
+                  placeholder="1234567890:AAH_ваш_токен_от_BotFather..."
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
+                />
+                <p className="text-[11px] text-slate-500 mt-1">
+                  Если указать токен, вы сможете писать боту прямо со своего телефона в Telegram!
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-300 mb-1">
+                  Google Gemini API Key (опционально)
+                </label>
+                <input
+                  type="password"
+                  value={geminiKeyInput}
+                  onChange={(e) => setGeminiKeyInput(e.target.value)}
+                  placeholder={
+                    liveBotStatus.hasGeminiKey
+                      ? '✅ Ключ уже настроен (введите новый для замены)'
+                      : 'AIzaSy_ваш_ключ_Gemini_API...'
+                  }
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
+                />
+                <p className="text-[11px] text-slate-500 mt-1">
+                  Даже без ключа бот работает на встроенном интеллектуальном движке Sana Mentor.
+                </p>
+              </div>
+
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowConnectModal(false)}
+                  className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium"
+                >
+                  Отмена
+                </button>
+                <button
+                  type="submit"
+                  disabled={isConnectingBot}
+                  className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white text-xs font-semibold flex items-center gap-1.5"
+                >
+                  {isConnectingBot ? 'Подключение...' : '🚀 Сохранить и запустить'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Hidden File Input for real uploads */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        onChange={handleRealFileUpload}
+        className="hidden"
+        accept=".pdf,.docx,.txt,.md,.py,.js,.ts,.json,.csv,image/*"
+      />
+
+      {/* Left Column: Telegram Phone Simulator */}
+      <div className="flex-1 flex flex-col items-center justify-center p-4 lg:p-6 bg-radial from-slate-900 to-slate-950">
+        <div className="w-full max-w-[430px] h-[760px] max-h-full bg-[#0e1621] rounded-[36px] border-[8px] border-slate-800 shadow-2xl flex flex-col overflow-hidden relative">
+          {/* Telegram Header */}
+          <div className="bg-[#17212b] px-4 py-3 flex items-center justify-between border-b border-slate-800/80 z-10">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-full bg-gradient-to-tr from-indigo-600 to-violet-500 flex items-center justify-center text-white font-bold text-lg shadow-inner">
                 S
               </div>
-              <span className="absolute bottom-0 right-0 w-2.5 h-2.5 bg-emerald-500 border-2 border-[#17212b] rounded-full"></span>
-            </div>
-            <div className="min-w-0">
-              <div className="flex items-center gap-1.5 flex-wrap">
-                <span className="font-semibold text-white tracking-wide text-xs sm:text-sm">Sana AI</span>
-                <span className="text-[9px] px-1 py-0.2 rounded bg-cyan-500/20 text-cyan-400 font-mono">bot</span>
-                <span className={`text-[10px] sm:text-xs px-1.5 sm:px-2 py-0.5 rounded-full border flex items-center gap-1 ${modeBadge.color}`}>
-                  <span>{modeBadge.icon}</span>
-                  <span className="font-medium">{modeBadge.title}</span>
-                </span>
-              </div>
-              <p className="text-[11px] text-slate-400 truncate max-w-[140px] sm:max-w-xs">
-                {isBotTyping ? (
-                  <span className="text-cyan-400 animate-pulse font-medium">печатает...</span>
-                ) : (
-                  'Второй мозг для учёбы и работы'
-                )}
-              </p>
-            </div>
-          </div>
-
-          {/* Quick Header Actions */}
-          <div className="flex items-center gap-2">
-            {/* Language Switcher */}
-            <div className="hidden sm:flex items-center bg-[#0e1621] rounded-lg p-0.5 border border-slate-700">
-              {(['ru', 'kk', 'en'] as Language[]).map((lng) => (
-                <button
-                  key={lng}
-                  onClick={() => setUser((prev) => ({ ...prev, language: lng }))}
-                  className={`px-2 py-1 text-xs rounded uppercase font-semibold transition-all ${
-                    user.language === lng ? 'bg-cyan-600 text-white shadow-xs' : 'text-slate-400 hover:text-white'
-                  }`}
-                >
-                  {lng}
-                </button>
-              ))}
-            </div>
-
-            {/* Quota Meter */}
-            <div
-              onClick={() => setShowStarsModal(true)}
-              className="cursor-pointer flex items-center gap-2 px-3 py-1.5 rounded-lg bg-[#242f3d] hover:bg-[#2b394a] transition border border-slate-700 text-xs"
-              title="Нажмите для управления тарифом"
-            >
-              {user.isPro ? (
-                <span className="flex items-center gap-1 text-amber-400 font-semibold">
-                  <Sparkles className="w-3.5 h-3.5 fill-amber-400 text-amber-400" />
-                  Sana Pro
-                </span>
-              ) : (
+              <div>
                 <div className="flex items-center gap-1.5">
-                  <Flame className="w-3.5 h-3.5 text-orange-400" />
-                  <span className="font-medium text-slate-300">
-                    {Math.max(0, user.dailyLimit - user.queriesUsedToday)}/20
+                  <h2 className="text-white font-semibold text-sm">Sana AI Mentor</h2>
+                  <span className="bg-blue-500 text-white text-[10px] px-1.5 py-0.2 rounded-full font-bold">
+                    bot
                   </span>
-                  {user.bonusQueries > 0 && (
-                    <span className="text-[10px] bg-emerald-500/20 text-emerald-400 px-1 rounded font-bold">
-                      +{user.bonusQueries}
-                    </span>
-                  )}
                 </div>
-              )}
+                <p className="text-[#6c7883] text-xs">
+                  {isTyping
+                    ? 'печатает...'
+                    : liveBotStatus.running && liveBotStatus.botInfo
+                    ? `🟢 Live: @${liveBotStatus.botInfo.username}`
+                    : 'в сети • ИИ-ментор'}
+                </p>
+              </div>
             </div>
 
-            {/* Reminders Bell */}
-            <button
-              onClick={() => setShowRemindersModal(true)}
-              className="relative p-2 rounded-lg bg-[#242f3d] hover:bg-[#2b394a] text-slate-300 hover:text-white transition"
-              title="Напоминания"
-              aria-label="Напоминания"
-            >
-              <Calendar className="w-4 h-4" />
-              {reminders.length > 0 && (
-                <span className="absolute -top-1 -right-1 w-4 h-4 bg-cyan-500 text-[10px] text-white font-bold rounded-full flex items-center justify-center">
-                  {reminders.length}
-                </span>
-              )}
-            </button>
-
-            {/* Long-term Memory facts button */}
-            <button
-              onClick={() => setShowMemoryModal(true)}
-              className="p-2 rounded-lg bg-[#242f3d] hover:bg-[#2b394a] text-slate-300 hover:text-white transition"
-              title="Долгосрочная память"
-              aria-label="Долгосрочная память"
-            >
-              <Brain className="w-4 h-4 text-purple-400" />
-            </button>
-
-            {/* Export dialog */}
-            <button
-              onClick={exportDialogAsMarkdown}
-              className="p-2 rounded-lg bg-[#242f3d] hover:bg-[#2b394a] text-slate-300 hover:text-white transition"
-              title="Экспорт в Markdown"
-              aria-label="Экспорт в Markdown"
-            >
-              <Download className="w-4 h-4" />
-            </button>
-          </div>
-        </header>
-
-        {/* Message Thread */}
-        <div className="flex-1 overflow-y-auto px-3 sm:px-6 py-4 space-y-3.5 bg-radial from-[#121924] to-[#0b0f16]">
-          {messages.map((msg) => (
-            <div
-              key={msg.id}
-              className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'} max-w-full`}
-            >
-              <div
-                className={`relative px-4 py-3 rounded-2xl max-w-[88%] sm:max-w-[75%] shadow-md text-sm leading-relaxed ${
-                  msg.role === 'user'
-                    ? 'bg-[#2b5278] text-white rounded-tr-xs'
-                    : 'bg-[#182533] text-slate-200 border border-slate-800 rounded-tl-xs'
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={() => setShowConnectModal(true)}
+                title="Подключить реального Telegram-бота (@BotFather) или API-ключ"
+                className={`text-xs px-2.5 py-1.5 rounded-lg flex items-center gap-1 transition-colors border ${
+                  liveBotStatus.running
+                    ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
+                    : 'bg-[#242f3d] hover:bg-[#2b3848] text-slate-300 border-slate-700'
                 }`}
               >
-                {/* Optional attachment preview */}
-                {msg.attachment && (
-                  <div className="mb-2 p-2 rounded-lg bg-black/20 border border-white/10 flex items-center gap-2">
-                    {msg.attachment.type === 'file' && <FileText className="w-5 h-5 text-cyan-400 shrink-0" />}
-                    {msg.attachment.type === 'image' && <ImageIcon className="w-5 h-5 text-emerald-400 shrink-0" />}
-                    {msg.attachment.type === 'voice' && <Volume2 className="w-5 h-5 text-amber-400 shrink-0" />}
-                    <div className="text-xs truncate">
-                      <div className="font-semibold text-slate-200">{msg.attachment.name || 'Вложение'}</div>
-                      {msg.attachment.transcription && (
-                        <div className="text-slate-400 italic">«{msg.attachment.transcription}»</div>
-                      )}
+                <Settings className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">{liveBotStatus.running ? 'Live ON' : 'API / Бот'}</span>
+              </button>
+              <button
+                onClick={() => handleSend('/mode')}
+                className="text-xs bg-[#242f3d] hover:bg-[#2b3848] text-indigo-300 px-2.5 py-1.5 rounded-lg transition-colors border border-slate-700"
+              >
+                /mode
+              </button>
+            </div>
+          </div>
+
+          {/* Messages Area */}
+          <div className="flex-1 overflow-y-auto p-4 space-y-3 bg-[#0e1621] scrollbar-thin">
+            {messages.map((msg) => (
+              <div
+                key={msg.id}
+                className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}
+              >
+                <div
+                  className={`max-w-[86%] rounded-2xl px-3.5 py-2.5 text-sm relative ${
+                    msg.role === 'user'
+                      ? 'bg-[#2b5278] text-white rounded-br-xs'
+                      : 'bg-[#182533] text-slate-100 rounded-bl-xs'
+                  } shadow-sm`}
+                >
+                  <div className="leading-relaxed break-words">{renderFormattedText(msg.text)}</div>
+
+                  {/* Document Attachment */}
+                  {msg.isDocument && (
+                    <div className="mt-3 p-2.5 bg-[#0e1621]/60 rounded-xl border border-slate-700/50 flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <div className="p-2 bg-indigo-500/20 text-indigo-400 rounded-lg shrink-0">
+                          <FileText className="w-5 h-5" />
+                        </div>
+                        <div className="truncate">
+                          <div className="text-xs font-medium text-white truncate">
+                            {msg.isDocument.filename}
+                          </div>
+                          <div className="text-[10px] text-slate-400">Markdown Document</div>
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => {
+                          const blob = new Blob([msg.isDocument!.content], { type: 'text/markdown' });
+                          const url = URL.createObjectURL(blob);
+                          const a = document.createElement('a');
+                          a.href = url;
+                          a.download = msg.isDocument!.filename;
+                          a.click();
+                        }}
+                        className="p-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs flex items-center gap-1 shrink-0"
+                      >
+                        <Download className="w-3.5 h-3.5" /> Скачать
+                      </button>
                     </div>
+                  )}
+
+                  {/* Telegram Stars Invoice */}
+                  {msg.isInvoice && (
+                    <div className="mt-3 pt-3 border-t border-slate-700/60">
+                      <button
+                        onClick={() => handlePayInvoice(msg.id)}
+                        className="w-full py-2 bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-bold rounded-xl text-xs flex items-center justify-center gap-1.5 shadow-lg shadow-amber-500/10 transition-all"
+                      >
+                        <Star className="w-4 h-4 fill-slate-950" /> Заплатить 250 ⭐️
+                      </button>
+                    </div>
+                  )}
+
+                  <div className="flex items-center justify-end gap-1 mt-1">
+                    <span className="text-[10px] text-[#6c7883]">{msg.timestamp}</span>
+                    {msg.role === 'user' && <CheckCheck className="w-3 h-3 text-[#53bdeb]" />}
+                  </div>
+                </div>
+
+                {/* Inline Keyboard */}
+                {msg.inlineKeyboard && (
+                  <div className="w-full max-w-[86%] mt-1 space-y-1">
+                    {msg.inlineKeyboard.map((row, rIdx) => (
+                      <div key={rIdx} className="flex gap-1">
+                        {row.map((btn, bIdx) => (
+                          <button
+                            key={bIdx}
+                            onClick={() => handleCallback(btn.callback_data, msg.id)}
+                            className="flex-1 py-2 px-3 bg-[#202b36]/90 hover:bg-[#293644] text-white text-xs font-medium rounded-xl transition-colors text-center border border-slate-800/50"
+                          >
+                            {btn.text}
+                          </button>
+                        ))}
+                      </div>
+                    ))}
                   </div>
                 )}
-
-                {/* Message text with formatting */}
-                <div className="whitespace-pre-wrap font-sans break-words selection:bg-cyan-500 selection:text-white">
-                  {msg.content}
-                </div>
-
-                {/* Timestamp and status */}
-                <div className="mt-1 flex items-center justify-end gap-1 text-[11px] text-slate-400 select-none">
-                  <span>{msg.timestamp}</span>
-                  {msg.role === 'user' && <Check className="w-3.5 h-3.5 text-cyan-300 inline" />}
-                </div>
               </div>
+            ))}
+            <div ref={messagesEndRef} />
+          </div>
 
-              {/* Inline Buttons below bot messages */}
-              {msg.inlineButtons && msg.inlineButtons.length > 0 && (
-                <div className="mt-2 flex flex-wrap gap-1.5 max-w-[85%]">
-                  {msg.inlineButtons.map((btn, idx) => (
-                    <button
-                      key={idx}
-                      onClick={() => handleInlineClick(btn.data)}
-                      className="px-3 py-1.5 text-xs font-medium rounded-lg bg-[#242f3d] hover:bg-cyan-700/60 active:scale-98 text-cyan-300 hover:text-white border border-cyan-500/20 transition-all flex items-center gap-1.5 shadow-xs"
-                    >
-                      {btn.text}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-          ))}
+          {/* Quick Commands Bar */}
+          <div className="bg-[#17212b] px-3 py-1.5 flex items-center gap-1.5 overflow-x-auto border-t border-slate-800/60 scrollbar-none">
+            {[
+              { cmd: '/mode', label: '🎭 Режим' },
+              { cmd: '/plan Позвонить через 1 минуту', label: '⏰ Напоминание' },
+              { cmd: '/reminders', label: '📋 Задачи' },
+              { cmd: '/memory', label: '🧠 Память' },
+              { cmd: '/profile', label: '👤 Профиль' },
+              { cmd: '/subscribe', label: '⭐️ PRO' },
+              { cmd: '/export', label: '📦 Экспорт' },
+              { cmd: '/clear', label: '🧹 Очистить' },
+              { cmd: '/help', label: '❓ Помощь' },
+            ].map((item) => (
+              <button
+                key={item.cmd}
+                onClick={() => handleSend(item.cmd)}
+                className="text-[11px] bg-[#242f3d] hover:bg-[#2e3c4e] text-slate-300 px-2.5 py-1 rounded-full whitespace-nowrap transition-colors"
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
 
-          {/* Typing Indicator */}
-          {isBotTyping && (
-            <div className="flex items-center gap-2 text-slate-400 text-xs px-3 py-2 bg-[#182533] border border-slate-800 rounded-xl w-fit">
-              <Bot className="w-4 h-4 text-cyan-400 animate-spin" />
-              <span>Sana AI формулирует мысль...</span>
-            </div>
-          )}
+          {/* Input Bar */}
+          <div className="bg-[#17212b] px-3 py-2.5 flex items-center gap-2 border-t border-slate-800 relative">
+            {/* Attach Menu Popup */}
+            {showAttachMenu && (
+              <div className="absolute bottom-14 left-3 bg-[#1c2733] border border-slate-700 rounded-2xl p-2 shadow-xl flex flex-col gap-1 w-60 z-20">
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  className="flex items-center gap-2.5 px-3 py-2 hover:bg-slate-800 rounded-xl text-xs text-emerald-300 text-left font-medium"
+                >
+                  <Paperclip className="w-4 h-4 text-emerald-400" /> Загрузить свой файл с ПК...
+                </button>
+                <div className="h-px bg-slate-800 my-0.5" />
+                <button
+                  onClick={() => simulateMedia('pdf')}
+                  className="flex items-center gap-2.5 px-3 py-2 hover:bg-slate-800 rounded-xl text-xs text-slate-200 text-left"
+                >
+                  <FileText className="w-4 h-4 text-rose-400" /> Демо PDF документ
+                </button>
+                <button
+                  onClick={() => simulateMedia('photo')}
+                  className="flex items-center gap-2.5 px-3 py-2 hover:bg-slate-800 rounded-xl text-xs text-slate-200 text-left"
+                >
+                  <ImageIcon className="w-4 h-4 text-emerald-400" /> Демо фото задачи
+                </button>
+                <button
+                  onClick={() => simulateMedia('voice')}
+                  className="flex items-center gap-2.5 px-3 py-2 hover:bg-slate-800 rounded-xl text-xs text-slate-200 text-left"
+                >
+                  <Mic className="w-4 h-4 text-amber-400" /> Демо голосовое (Voice)
+                </button>
+              </div>
+            )}
 
-          <div ref={chatEndRef} />
-        </div>
-
-        {/* Quick Suggestion Chips */}
-        <div className="px-4 py-1.5 bg-[#17212b]/80 border-t border-slate-800/80 flex items-center gap-2 overflow-x-auto no-scrollbar shrink-0 text-xs">
-          <span className="text-slate-500 shrink-0 font-medium text-[11px]">Команды:</span>
-          {[
-            { label: '/mode — Режимы', cmd: '/mode' },
-            { label: 'Напомни завтра в 10:00...', cmd: 'Напомни завтра в 10:00 сдать курсовую работу' },
-            { label: 'Тест по истории', cmd: 'Проэкзаменуй меня по теме Вторая мировая война' },
-            { label: 'Разбор алгоритма O(N)', cmd: 'Объясни бинарный поиск и сложность алгоритмов' },
-            { label: '/plan — Тарифы', cmd: '/plan' },
-          ].map((chip, idx) => (
             <button
-              key={idx}
-              onClick={() => handleSendMessage(chip.cmd)}
-              className="shrink-0 px-2.5 py-1 rounded-full bg-[#242f3d] hover:bg-[#2f3d4f] text-slate-300 hover:text-white border border-slate-700/60 transition"
-            >
-              {chip.label}
-            </button>
-          ))}
-        </div>
-
-        {/* Chat Input Bar */}
-        <div className="p-3 bg-[#17212b] border-t border-slate-800 shrink-0 relative">
-          {/* Attachment Popup Menu */}
-          {showAttachMenu && (
-            <div className="absolute bottom-16 left-4 p-3 bg-[#242f3d] border border-slate-700 rounded-xl shadow-2xl z-20 w-80 space-y-2">
-              <div className="text-xs font-bold text-slate-300 uppercase tracking-wider mb-2">
-                Загрузить для разбора
-              </div>
-
-              {/* Study Samples */}
-              <div className="space-y-1">
-                <button
-                  onClick={() =>
-                    handleAnalyzeDocumentSample(
-                      'Конспект_Микроэкономика_Спрос_и_Предложение.pdf',
-                      'Микроэкономика: Закон спроса и предложения. Эластичность спроса по цене. Рыночное равновесие. Излишек потребителя и излишек производителя. Государственное регулирование цен: потолок и пол цен. Налоговое бремя.'
-                    )
-                  }
-                  className="w-full text-left px-2.5 py-1.5 rounded-lg bg-[#182533] hover:bg-cyan-900/40 text-xs text-slate-200 flex items-center gap-2 transition"
-                >
-                  <FileText className="w-4 h-4 text-cyan-400 shrink-0" />
-                  <span className="truncate">📄 Конспект: Микроэкономика.pdf</span>
-                </button>
-
-                <button
-                  onClick={() =>
-                    handleAnalyzeDocumentSample(
-                      'Алгоритмы_и_структуры_данных.docx',
-                      'Структуры данных: Связные списки, бинарные деревья поиска, красно-черные деревья, хэш-таблицы. Разрешение коллизий методом цепочек и открытой адресацией. Оценка временной сложности в худшем и среднем случае O(1) vs O(N).'
-                    )
-                  }
-                  className="w-full text-left px-2.5 py-1.5 rounded-lg bg-[#182533] hover:bg-cyan-900/40 text-xs text-slate-200 flex items-center gap-2 transition"
-                >
-                  <FileText className="w-4 h-4 text-emerald-400 shrink-0" />
-                  <span className="truncate">📄 Лекция: Структуры данных.docx</span>
-                </button>
-
-                <button
-                  onClick={() =>
-                    handleAnalyzePhotoSample(
-                      'Задача_по_физике_кинематика.jpg',
-                      'Тело брошено под углом 30 градусов к горизонту с начальной скоростью 20 м/с. Найти дальность полета и максимальную высоту подъема.'
-                    )
-                  }
-                  className="w-full text-left px-2.5 py-1.5 rounded-lg bg-[#182533] hover:bg-cyan-900/40 text-xs text-slate-200 flex items-center gap-2 transition"
-                >
-                  <ImageIcon className="w-4 h-4 text-amber-400 shrink-0" />
-                  <span className="truncate">📷 Фото задачи: Кинематика</span>
-                </button>
-              </div>
-            </div>
-          )}
-
-          <div className="flex items-center gap-2">
-            {/* Attachment Button */}
-            <button
-              onClick={() => setShowAttachMenu((prev) => !prev)}
-              className="p-2.5 rounded-full hover:bg-[#242f3d] text-slate-400 hover:text-cyan-400 transition"
+              onClick={() => setShowAttachMenu(!showAttachMenu)}
+              className="p-2 text-[#6c7883] hover:text-slate-200 transition-colors"
               title="Прикрепить файл или фото"
-              aria-label="Прикрепить файл или фото"
             >
               <Paperclip className="w-5 h-5" />
             </button>
 
-            {/* Text Input */}
-            <div className="flex-1 relative">
-              <input
-                type="text"
-                value={inputText}
-                onChange={(e) => setInputText(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
-                    handleSendMessage();
-                  }
-                }}
-                placeholder={
-                  isRecording
-                    ? `🔴 Идет запись голоса... (${recordTimer}с)`
-                    : 'Напишите сообщение или «Напомни завтра в...»'
-                }
-                className="w-full bg-[#242f3d] text-white placeholder-slate-400 text-sm px-4 py-2.5 rounded-xl border border-slate-700/80 focus:outline-hidden focus:border-cyan-500 transition"
-              />
-            </div>
+            <input
+              type="text"
+              value={inputText}
+              onChange={(e) => setInputText(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && handleSend()}
+              placeholder="Написать сообщение..."
+              className="flex-1 bg-transparent text-white text-sm placeholder-[#6c7883] focus:outline-none"
+            />
 
-            {/* Voice Message Recording Button */}
-            <button
-              onClick={handleToggleVoiceRecording}
-              className={`p-2.5 rounded-full transition ${
-                isRecording
-                  ? 'bg-rose-600 text-white animate-pulse shadow-lg shadow-rose-600/30'
-                  : 'hover:bg-[#242f3d] text-slate-400 hover:text-cyan-400'
-              }`}
-              title={isRecording ? 'Остановить и отправить' : 'Голосовое сообщение'}
-              aria-label={isRecording ? 'Остановить и отправить' : 'Голосовое сообщение'}
-            >
-              <Mic className="w-5 h-5" />
-            </button>
-
-            {/* Send Button */}
-            <button
-              onClick={() => handleSendMessage()}
-              disabled={!inputText.trim()}
-              className="p-2.5 rounded-full bg-cyan-600 hover:bg-cyan-500 disabled:opacity-40 text-white transition shadow-sm"
-              title="Отправить"
-              aria-label="Отправить"
-            >
-              <Send className="w-4 h-4" />
-            </button>
+            {inputText.trim() ? (
+              <button
+                onClick={() => handleSend()}
+                className="p-2 bg-[#5288c1] hover:bg-[#6197d1] text-white rounded-full transition-colors"
+              >
+                <Send className="w-4 h-4" />
+              </button>
+            ) : (
+              <button
+                onClick={() => simulateMedia('voice')}
+                title="Отправить тестовое голосовое сообщение"
+                className="p-2 text-[#6c7883] hover:text-amber-400 transition-colors"
+              >
+                <Mic className="w-5 h-5" />
+              </button>
+            )}
           </div>
         </div>
       </div>
 
-      {/* MODAL 1: Telegram Stars & Sana Pro Checkout */}
-      {showStarsModal && (
-        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-[#17212b] border border-slate-700 rounded-2xl w-full max-w-md p-6 shadow-2xl relative">
+      {/* Right Column: Live Internal State Inspector (DB / Redis / Memory) */}
+      <div className="w-96 border-l border-slate-800 bg-slate-900/50 p-5 overflow-y-auto hidden xl:flex flex-col gap-5">
+        <div>
+          <div className="flex items-center justify-between mb-1">
+            <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-indigo-400" /> Live State Inspector
+            </h3>
             <button
-              onClick={() => setShowStarsModal(false)}
-              className="absolute top-4 right-4 text-slate-400 hover:text-white"
+              onClick={() => setShowConnectModal(true)}
+              className="text-[11px] text-indigo-400 hover:text-indigo-300 font-medium"
             >
-              <X className="w-5 h-5" />
-            </button>
-
-            <div className="text-center mb-6">
-              <div className="w-14 h-14 mx-auto mb-3 rounded-2xl bg-gradient-to-tr from-amber-500 to-orange-400 flex items-center justify-center text-white shadow-lg">
-                <Sparkles className="w-8 h-8 fill-white" />
-              </div>
-              <h3 className="text-xl font-bold text-white">Sana Pro Подписка</h3>
-              <p className="text-sm text-slate-400 mt-1">
-                Максимальная производительность для учёбы и фриланса
-              </p>
-            </div>
-
-            <div className="space-y-3 mb-6 bg-[#0e1621] p-4 rounded-xl border border-slate-800 text-sm">
-              <div className="flex items-center gap-2 text-slate-200">
-                <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-                <span>Полный безлимит запросов без дневного ограничения</span>
-              </div>
-              <div className="flex items-center gap-2 text-slate-200">
-                <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-                <span>Углублённая модель Gemini Pro с логическим рассуждением</span>
-              </div>
-              <div className="flex items-center gap-2 text-slate-200">
-                <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-                <span>Загрузка учебников и документов до 50 МБ</span>
-              </div>
-              <div className="flex items-center gap-2 text-slate-200">
-                <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-                <span>Приоритетная очередь и ускоренная генерация</span>
-              </div>
-            </div>
-
-            <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-xl mb-6 text-center">
-              <div className="text-xs text-amber-400 uppercase font-bold tracking-wider">
-                Стоимость через Telegram Stars
-              </div>
-              <div className="text-2xl font-black text-amber-300 mt-0.5">
-                100 ⭐ <span className="text-sm font-normal text-slate-400">(≈ 990 ₸ / 1 900 ₽)</span>
-              </div>
-            </div>
-
-            <button
-              onClick={handleConfirmStarsPayment}
-              className="w-full py-3 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-bold transition flex items-center justify-center gap-2 shadow-lg"
-            >
-              <Sparkles className="w-4 h-4 fill-slate-950" />
-              Оплатить 100 Stars и активировать Pro
+              Настроить API
             </button>
           </div>
+          <p className="text-xs text-slate-500">
+            Визуализация работы PostgreSQL, Redis и фоновых воркеров в реальном времени.
+          </p>
         </div>
-      )}
 
-      {/* MODAL 2: Long-Term Memory Inspector */}
-      {showMemoryModal && (
-        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-[#17212b] border border-slate-700 rounded-2xl w-full max-w-lg p-6 shadow-2xl relative">
-            <button
-              onClick={() => setShowMemoryModal(false)}
-              className="absolute top-4 right-4 text-slate-400 hover:text-white"
+        {/* Live Telegram Bot Connection Card */}
+        <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-2.5">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+              <Radio className="w-3.5 h-3.5 text-indigo-400" /> Реальный Telegram Бот
+            </span>
+            <span
+              className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${
+                liveBotStatus.running
+                  ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                  : 'bg-slate-800 text-slate-400'
+              }`}
             >
-              <X className="w-5 h-5" />
-            </button>
-
-            <div className="flex items-center gap-3 mb-4">
-              <div className="p-2.5 rounded-xl bg-purple-500/20 text-purple-400">
-                <Brain className="w-6 h-6" />
-              </div>
+              {liveBotStatus.running ? 'ONLINE' : 'STANDBY'}
+            </span>
+          </div>
+          {liveBotStatus.running && liveBotStatus.botInfo ? (
+            <div className="text-xs text-slate-300 space-y-1">
               <div>
-                <h3 className="text-lg font-bold text-white">Долгосрочная память Sana AI</h3>
-                <p className="text-xs text-slate-400">
-                  Факты о вас, извлечённые нейросетью из ваших сообщений
-                </p>
+                Бот: <span className="text-indigo-400 font-mono">@{liveBotStatus.botInfo.username}</span>
+              </div>
+              <div className="text-slate-400">
+                Обработано сообщений: <strong className="text-white">{liveBotStatus.processedUpdates}</strong>
               </div>
             </div>
+          ) : (
+            <p className="text-xs text-slate-400">
+              Вы можете подключить токен от <code>@BotFather</code> и общаться с ботом прямо в Telegram.
+            </p>
+          )}
+          <button
+            onClick={() => setShowConnectModal(true)}
+            className="w-full py-1.5 bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 rounded-lg text-xs font-medium transition-colors"
+          >
+            {liveBotStatus.running ? '⚙️ Управление подключением' : '🔌 Подключить @BotFather токен'}
+          </button>
+        </div>
 
-            <div className="space-y-2 max-h-60 overflow-y-auto mb-4 pr-1">
-              {memories.length === 0 ? (
-                <div className="text-center py-8 text-slate-500 text-sm">
-                  Пока нет сохранённых фактов. Общайтесь с ботом, и он автоматически запомнит ваш вуз, цели и любимые темы!
-                </div>
-              ) : (
-                memories.map((fact, idx) => (
-                  <div
-                    key={idx}
-                    className="p-3 rounded-xl bg-[#0e1621] border border-slate-800 text-xs text-slate-200 flex items-center justify-between"
-                  >
-                    <span>📌 {fact}</span>
-                    <button
-                      onClick={() => setMemories((prev) => prev.filter((_, i) => i !== idx))}
-                      className="text-slate-500 hover:text-rose-400 text-xs ml-2"
-                    >
-                      ✕
-                    </button>
-                  </div>
-                ))
-              )}
+        {/* User DB Record */}
+        <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+              <UserCheck className="w-3.5 h-3.5 text-emerald-400" /> Таблица `users`
+            </span>
+            <span
+              className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${
+                user.tier === 'PRO'
+                  ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
+                  : 'bg-slate-800 text-slate-400'
+              }`}
+            >
+              {user.tier} TIER
+            </span>
+          </div>
+          <div className="grid grid-cols-2 gap-2 text-xs">
+            <div className="bg-slate-950 p-2 rounded-lg border border-slate-800/60">
+              <div className="text-slate-500 text-[10px]">Активный режим</div>
+              <div className="text-indigo-400 font-mono font-medium mt-0.5">{user.active_mode}</div>
             </div>
-
-            {/* Add custom fact */}
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={newFactInput}
-                onChange={(e) => setNewFactInput(e.target.value)}
-                placeholder="Добавить факт вручную (например: Студент 3 курса IT)"
-                className="flex-1 bg-[#242f3d] text-white text-xs px-3 py-2 rounded-xl border border-slate-700 focus:outline-hidden"
-              />
+            <div className="bg-slate-950 p-2 rounded-lg border border-slate-800/60">
+              <div className="text-slate-500 text-[10px]">Язык (i18n)</div>
+              <div className="text-emerald-400 font-mono font-medium mt-0.5">
+                {user.language.toUpperCase()}
+              </div>
+            </div>
+            <div className="col-span-2 bg-slate-950 p-2 rounded-lg border border-slate-800/60 flex items-center justify-between">
+              <div>
+                <div className="text-slate-500 text-[10px]">Дневная квота запросов</div>
+                <div className="text-slate-200 font-mono font-medium mt-0.5">
+                  {user.daily_requests_count} / {user.tier === 'PRO' ? '∞' : '20'}
+                </div>
+              </div>
               <button
-                onClick={() => {
-                  if (newFactInput.trim()) {
-                    setMemories((prev) => [...prev, newFactInput.trim()]);
-                    setNewFactInput('');
-                  }
-                }}
-                className="px-3 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-xl text-xs font-semibold"
+                onClick={() => setUser((prev) => ({ ...prev, tier: prev.tier === 'PRO' ? 'FREE' : 'PRO' }))}
+                className="text-[10px] bg-slate-800 hover:bg-slate-700 text-slate-300 px-2 py-1 rounded border border-slate-700"
               >
-                Добавить
+                Сменить тариф
               </button>
             </div>
           </div>
         </div>
-      )}
 
-      {/* MODAL 3: Reminders Planner */}
-      {showRemindersModal && (
-        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-[#17212b] border border-slate-700 rounded-2xl w-full max-w-lg p-6 shadow-2xl relative">
-            <button
-              onClick={() => setShowRemindersModal(false)}
-              className="absolute top-4 right-4 text-slate-400 hover:text-white"
-            >
-              <X className="w-5 h-5" />
-            </button>
-
-            <div className="flex items-center gap-3 mb-4">
-              <div className="p-2.5 rounded-xl bg-cyan-500/20 text-cyan-400">
-                <Calendar className="w-6 h-6" />
-              </div>
-              <div>
-                <h3 className="text-lg font-bold text-white">Умные напоминания</h3>
-                <p className="text-xs text-slate-400">
-                  Планировщик с учётом часового пояса ({user.timezone})
-                </p>
-              </div>
-            </div>
-
-            <div className="space-y-2 max-h-60 overflow-y-auto mb-4 pr-1">
-              {reminders.length === 0 ? (
-                <div className="text-center py-8 text-slate-500 text-sm">
-                  Активных напоминаний нет. Напишите боту: «Напомни завтра в 10:00 сдать курсовую»!
-                </div>
-              ) : (
-                reminders.map((rem) => (
-                  <div
-                    key={rem.id}
-                    className="p-3 rounded-xl bg-[#0e1621] border border-slate-800 text-xs text-slate-200 flex items-center justify-between"
-                  >
-                    <div>
-                      <div className="font-semibold text-slate-100">📌 {rem.title}</div>
-                      <div className="text-[11px] text-cyan-400 mt-0.5">
-                        ⏰ {new Date(rem.datetimeIso).toLocaleString('ru-RU')}
-                      </div>
-                    </div>
-                    <button
-                      onClick={() => setReminders((prev) => prev.filter((r) => r.id !== rem.id))}
-                      className="text-slate-500 hover:text-rose-400 text-xs px-2 py-1"
-                    >
-                      Удалить
-                    </button>
-                  </div>
-                ))
+        {/* Long-Term Memory (`user_memories`) */}
+        <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+              <Brain className="w-3.5 h-3.5 text-purple-400" /> Долгосрочная память
+            </span>
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] text-slate-500">{memories.length} фактов</span>
+              {memories.length > 0 && (
+                <button
+                  onClick={() => setMemories([])}
+                  title="Очистить память"
+                  className="text-slate-500 hover:text-rose-400"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
               )}
             </div>
-
-            <div className="text-xs text-slate-400 bg-[#0e1621] p-3 rounded-xl border border-slate-800">
-              💡 <b>Совет:</b> Sana AI понимает естественный язык. Просто отправьте в чат фразу вроде:
-              <br />
-              <span className="text-cyan-300">«Напомни в четверг в 18:30 созвон с ментором»</span>
-            </div>
+          </div>
+          <p className="text-[11px] text-slate-400 leading-relaxed">
+            Фоновый `memory_service.py` анализирует каждый ваш ответ и автоматически извлекает важные факты в таблицу `user_memories`:
+          </p>
+          <div className="space-y-1.5 max-h-44 overflow-y-auto pr-1">
+            {memories.map((mem, idx) => (
+              <div
+                key={idx}
+                className="text-xs bg-slate-950 border border-slate-800/80 p-2 rounded-lg text-slate-300 flex items-start gap-2"
+              >
+                <Check className="w-3.5 h-3.5 text-purple-400 shrink-0 mt-0.5" />
+                <span>{mem}</span>
+              </div>
+            ))}
           </div>
         </div>
-      )}
 
-      {/* MODAL 4: Referral Program */}
-      {showReferralModal && (
-        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-[#17212b] border border-slate-700 rounded-2xl w-full max-w-md p-6 shadow-2xl relative">
-            <button
-              onClick={() => setShowReferralModal(false)}
-              className="absolute top-4 right-4 text-slate-400 hover:text-white"
-            >
-              <X className="w-5 h-5" />
-            </button>
-
-            <div className="text-center mb-5">
-              <div className="w-12 h-12 mx-auto mb-3 rounded-2xl bg-emerald-500/20 text-emerald-400 flex items-center justify-center">
-                <Share2 className="w-6 h-6" />
-              </div>
-              <h3 className="text-lg font-bold text-white">Реферальная программа</h3>
-              <p className="text-xs text-slate-400 mt-1">
-                +10 бонусных запросов за каждого приглашённого друга
-              </p>
-            </div>
-
-            <div className="bg-[#0e1621] p-4 rounded-xl border border-slate-800 mb-4 text-center">
-              <div className="text-xs text-slate-400 mb-1">Твоя персональная ссылка:</div>
-              <div className="font-mono text-xs bg-slate-900 py-2 px-3 rounded-lg text-cyan-300 select-all border border-slate-800">
-                https://t.me/SanaAIBot?start={user.referralCode}
-              </div>
-              <div className="text-xs text-emerald-400 font-semibold mt-2">
-                Уже приглашено друзей: {user.referralCount}
-              </div>
-            </div>
-
-            <button
-              onClick={() => {
-                navigator.clipboard.writeText(`https://t.me/SanaAIBot?start=${user.referralCode}`);
-                alert('Ссылка скопирована в буфер обмена!');
-              }}
-              className="w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs transition"
-            >
-              Скопировать ссылку
-            </button>
+        {/* APScheduler Reminders (`reminders`) */}
+        <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+              <Clock className="w-3.5 h-3.5 text-amber-400" /> APScheduler Задачи
+            </span>
+            <span className="text-[10px] text-slate-500">
+              {reminders.filter((r) => !r.completed).length} активных
+            </span>
           </div>
+          {reminders.length === 0 ? (
+            <div className="text-xs text-slate-500 italic py-2 text-center bg-slate-950 rounded-lg border border-slate-800/50">
+              Напишите `/plan Позвонить через 1 минуту` в чат
+            </div>
+          ) : (
+            <div className="space-y-1.5">
+              {reminders.map((rem) => (
+                <div
+                  key={rem.id}
+                  className={`text-xs p-2 rounded-lg border flex items-center justify-between ${
+                    rem.completed
+                      ? 'bg-slate-950/40 border-slate-800/40 text-slate-500 line-through'
+                      : 'bg-slate-950 border-amber-500/30 text-slate-200'
+                  }`}
+                >
+                  <span className="truncate pr-2">{rem.title}</span>
+                  <span className="text-[10px] font-mono text-amber-400 shrink-0">
+                    {rem.due_at.toLocaleTimeString([], {
+                      hour: '2-digit',
+                      minute: '2-digit',
+                      second: '2-digit',
+                    })}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
-      )}
+      </div>
     </div>
   );
-};
+}
+
+export default TelegramSimulator;

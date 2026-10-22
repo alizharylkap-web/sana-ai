@@ -5,56 +5,15 @@ import {
   Database,
   Shield,
   Layers,
-  Sparkles,
-  Bot
 } from 'lucide-react';
 import { TelegramSimulator } from './components/TelegramSimulator.tsx';
 import { CodeExplorer } from './components/CodeExplorer.tsx';
 import { DatabaseSchemaView } from './components/DatabaseSchemaView.tsx';
 import { AdminPanel } from './components/AdminPanel.tsx';
 import { ArchitectureView } from './components/ArchitectureView.tsx';
-import { UserProfile, UserReminder } from './types/index.ts';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'telegram' | 'code' | 'schema' | 'admin' | 'architecture'>('telegram');
-
-  // Shared user state for simulator
-  const [user, setUser] = useState<UserProfile>({
-    name: 'Димаш',
-    studyGoal: 'Сдать сессию и IT-проекты',
-    timezone: 'Asia/Almaty',
-    language: 'ru',
-    mode: 'mentor',
-    isPro: false,
-    queriesUsedToday: 4,
-    bonusQueries: 10,
-    dailyLimit: 20,
-    referralCode: 'sana77x',
-    referralCount: 1,
-    onboardingStep: 4,
-  });
-
-  const [reminders, setReminders] = useState<UserReminder[]>([
-    {
-      id: 'rem_1',
-      title: 'Сдать реферат по микроэкономике',
-      datetimeIso: '2026-10-23T14:00:00',
-      isCompleted: false,
-    },
-    {
-      id: 'rem_2',
-      title: 'Контрольный тест по базам данных',
-      datetimeIso: '2026-10-24T10:30:00',
-      isCompleted: false,
-    },
-  ]);
-
-  const [memories, setMemories] = useState<string[]>([
-    'Студент 3 курса факультета информационных технологий',
-    'Изучает алгоритмы, Python и микросервисную архитектуру',
-    'Готовится к защите курсового проекта в ноябре',
-    'Предпочитает объяснения с примерами на коде',
-  ]);
 
   return (
     <div className="flex flex-col h-screen w-screen bg-[#090d14] text-slate-100 overflow-hidden font-sans">
@@ -72,7 +31,7 @@ export default function App() {
               </span>
             </div>
             <p className="text-[10px] text-slate-400 hidden sm:block">
-              Твой второй мозг для учёбы и работы • Google Gemini API
+              Твой второй мозг для учёбы и работы • Google Gemini API + aiogram 3.x
             </p>
           </div>
         </div>
@@ -145,15 +104,7 @@ export default function App() {
       {/* Main Content View */}
       <main className="flex-1 overflow-hidden relative">
         {activeTab === 'telegram' && (
-          <TelegramSimulator
-            user={user}
-            setUser={setUser}
-            reminders={reminders}
-            setReminders={setReminders}
-            memories={memories}
-            setMemories={setMemories}
-            onOpenAdmin={() => setActiveTab('admin')}
-          />
+          <TelegramSimulator onOpenAdmin={() => setActiveTab('admin')} />
         )}
         {activeTab === 'code' && <CodeExplorer />}
         {activeTab === 'schema' && <DatabaseSchemaView />}

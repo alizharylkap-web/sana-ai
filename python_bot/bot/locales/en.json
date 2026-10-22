@@ -1,0 +1,13 @@
+{
+  "welcome": "👋 <b>Hello! I am Sana AI</b>, your personal AI mentor and smart assistant.\n\nWhat I can do:\n• 🧠 Explain complex topics and write clean code\n• 📄 Analyze PDF, DOCX, TXT files and photos\n• 🎙 Transcribe and answer voice messages\n• ⏰ Set smart natural-language reminders (<code>/plan</code>)\n• 📌 Remember key facts about you (<code>/memory</code>)\n\nSelect your interface language or ask me anything:",
+  "choose_mode": "🎭 <b>Select Sana AI operating mode:</b>\n\n• <b>Mentor</b> — explains concepts using the Socratic method\n• <b>Coder</b> — writes clean code, debugs and reviews architecture\n• <b>Planner</b> — breaks goals down using GTD methodology\n• <b>Examiner</b> — tests your knowledge with targeted questions\n• <b>Editor</b> — polishes writing style, grammar and clarity",
+  "mode_changed": "✅ Active mode switched to: <b>{mode}</b>",
+  "quota_exceeded": "⚠️ You have reached your daily free limit (20/20 requests).\n\nUpgrade to <b>Sana PRO</b> (/subscribe) for unlimited access and the flagship <b>Gemini 2.5 Pro</b> model!",
+  "thinking": "⏳ <i>Sana is thinking...</i>",
+  "history_cleared": "🧹 Current conversation history cleared! Long-term memory is preserved (use /memory to view).",
+  "memory_header": "🧠 <b>Sana AI Long-Term Memory (known facts about you):</b>",
+  "memory_empty": "📭 Long-term memory is currently empty.\nTell me about your goals, projects, or interests and I will remember them automatically!",
+  "memory_cleared": "🗑 Long-term memory has been completely cleared.",
+  "profile_text": "👤 <b>Sana AI User Profile</b>\n\n🆔 ID: <code>{user_id}</code>\n💎 Tier: <b>{tier}</b>\n📊 Requests today: <b>{used} / {limit}</b>\n🎭 Mode: <b>{mode}</b>\n🌐 Language: <b>{lang}</b>",
+  "help_text": "📚 <b>Sana AI Commands:</b>\n\n• /start — Restart & choose language\n• /mode — Switch AI persona mode\n• /plan <i>[text]</i> — Create a smart reminder\n• /reminders — View active reminders\n• /memory — View facts stored in long-term memory\n• /forget — Clear long-term memory\n• /clear — Clear current conversation context\n• /profile — View your profile and quota usage\n• /subscribe — Upgrade to Sana PRO\n• /export — Export conversation history as Markdown (.md)"
+}

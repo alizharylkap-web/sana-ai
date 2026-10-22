@@ -1,10 +1,18 @@
 import secrets
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import zoneinfo
 from sqlalchemy import select, update, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 from bot.models.user import User
 from bot.config import config
+
+
+def _ensure_utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 class UserRepository:
@@ -26,6 +34,13 @@ class UserRepository:
     ) -> tuple[User, bool]:
         user = await self.get_by_telegram_id(telegram_id)
         if user:
+            # Обновляем актуальные данные профиля и статус админа
+            user.first_name = first_name or user.first_name
+            user.last_name = last_name
+            user.username = username
+            if telegram_id in config.ADMIN_IDS and not user.is_admin:
+                user.is_admin = True
+            await self.session.flush()
             return user, False
 
         referred_by_id = None
@@ -38,7 +53,7 @@ class UserRepository:
 
         user = User(
             telegram_id=telegram_id,
-            first_name=first_name,
+            first_name=first_name or "Студент",
             last_name=last_name,
             username=username,
             referral_code=new_ref_code,
@@ -57,6 +72,7 @@ class UserRepository:
                     referral_count=User.referral_count + 1
                 )
             )
+            await self.session.flush()
 
         return user, True
 
@@ -71,8 +87,10 @@ class UserRepository:
         Запрос НЕ списывается здесь.
         Возвращает: (разрешено, примерный остаток).
         """
+        now_utc = datetime.now(timezone.utc)
         if user.is_pro:
-            if user.pro_expires_at and user.pro_expires_at < datetime.utcnow():
+            expires_utc = _ensure_utc(user.pro_expires_at)
+            if expires_utc and expires_utc < now_utc:
                 user.is_pro = False
                 user.pro_expires_at = None
                 await self.session.flush()
@@ -86,7 +104,6 @@ class UserRepository:
 
         user_local_today = datetime.now(tz).date()
 
-        # Автоматический сброс при смене календарного дня по таймзоне
         if user.last_reset_date < user_local_today:
             user.queries_used_today = 0
             user.last_reset_date = user_local_today
@@ -116,7 +133,6 @@ class UserRepository:
             return True
 
         if user.last_reset_date < user_local_today:
-            # Сброс счетчика на новый день и списание первого запроса
             stmt = (
                 update(User)
                 .where(User.telegram_id == telegram_id)
@@ -129,7 +145,6 @@ class UserRepository:
             await self.session.flush()
             return True
 
-        # Списание из суточного лимита
         if user.queries_used_today < config.FREE_DAILY_LIMIT:
             stmt = (
                 update(User)
@@ -142,11 +157,10 @@ class UserRepository:
                 .values(queries_used_today=User.queries_used_today + 1)
             )
             res = await self.session.execute(stmt)
-            if res.rowcount > 0:
+            if res.rowcount and res.rowcount > 0:
                 await self.session.flush()
                 return True
 
-        # Списание из бонусных запросов
         if user.bonus_queries > 0:
             stmt = (
                 update(User)
@@ -159,23 +173,47 @@ class UserRepository:
                 .values(bonus_queries=User.bonus_queries - 1)
             )
             res = await self.session.execute(stmt)
-            if res.rowcount > 0:
+            if res.rowcount and res.rowcount > 0:
                 await self.session.flush()
                 return True
 
         return False
+
+    async def check_and_consume_quota(self, user: User) -> tuple[bool, int]:
+        """Удобный комбинированный метод проверки и списания квоты."""
+        allowed, remaining = await self.check_quota_precondition(user)
+        if not allowed:
+            return False, 0
+        if user.is_pro:
+            return True, 999999
+        await self.atomic_consume_quota(user.telegram_id, user.timezone)
+        return True, max(0, remaining - 1)
 
     async def grant_pro(self, user_id: int, days: int = 30) -> User | None:
         user = await self.get_by_telegram_id(user_id)
         if not user:
             return None
 
-        now = datetime.utcnow()
-        if user.is_pro and user.pro_expires_at and user.pro_expires_at > now:
-            user.pro_expires_at += timedelta(days=days)
+        now = datetime.now(timezone.utc)
+        expires_utc = _ensure_utc(user.pro_expires_at)
+        if user.is_pro and expires_utc and expires_utc > now:
+            user.pro_expires_at = expires_utc + timedelta(days=days)
         else:
             user.is_pro = True
             user.pro_expires_at = now + timedelta(days=days)
 
         await self.session.flush()
         return user
+
+    async def set_ban_status(self, user_id: int, is_banned: bool) -> User | None:
+        user = await self.get_by_telegram_id(user_id)
+        if not user:
+            return None
+        user.is_banned = is_banned
+        await self.session.flush()
+        return user
+
+    async def get_active_user_ids(self) -> list[int]:
+        query = select(User.telegram_id).where(User.is_banned == False)  # noqa: E712
+        result = await self.session.execute(query)
+        return list(result.scalars().all())

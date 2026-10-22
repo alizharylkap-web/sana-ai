@@ -6,7 +6,10 @@ import {
   checkUserQuota,
   consumeUserQuery,
   awardReferralBonus,
-  type UserQuotaState
+  checkAndConsumeQuota,
+  checkThrottle,
+  type UserQuotaState,
+  type UserState,
 } from './telegramLogic.ts';
 
 test('escapeMarkdownV2 properly escapes Telegram special characters', () => {
@@ -39,7 +42,7 @@ test('checkUserQuota permits requests within daily limit', () => {
     queriesUsedToday: 5,
     dailyLimit: 20,
     bonusQueries: 0,
-    lastResetDate: '2026-10-22'
+    lastResetDate: '2026-10-22',
   };
 
   const status = checkUserQuota(user, '2026-10-22');
@@ -54,7 +57,7 @@ test('checkUserQuota resets usage when a new day arrives', () => {
     queriesUsedToday: 20,
     dailyLimit: 20,
     bonusQueries: 0,
-    lastResetDate: '2026-10-21'
+    lastResetDate: '2026-10-21',
   };
 
   const status = checkUserQuota(user, '2026-10-22');
@@ -68,7 +71,7 @@ test('checkUserQuota blocks when limit reached without bonus', () => {
     queriesUsedToday: 20,
     dailyLimit: 20,
     bonusQueries: 0,
-    lastResetDate: '2026-10-22'
+    lastResetDate: '2026-10-22',
   };
 
   const status = checkUserQuota(user, '2026-10-22');
@@ -83,7 +86,7 @@ test('consumeUserQuery uses bonus queries after daily limit exhausted', () => {
     queriesUsedToday: 20,
     dailyLimit: 20,
     bonusQueries: 5,
-    lastResetDate: '2026-10-22'
+    lastResetDate: '2026-10-22',
   };
 
   const updated = consumeUserQuery(user, '2026-10-22');
@@ -97,7 +100,7 @@ test('awardReferralBonus adds 10 queries', () => {
     queriesUsedToday: 0,
     dailyLimit: 20,
     bonusQueries: 2,
-    lastResetDate: '2026-10-22'
+    lastResetDate: '2026-10-22',
   };
 
   const updated = awardReferralBonus(user, 10);
@@ -110,10 +113,40 @@ test('Pro users have unlimited access', () => {
     queriesUsedToday: 999,
     dailyLimit: 20,
     bonusQueries: 0,
-    lastResetDate: '2026-10-22'
+    lastResetDate: '2026-10-22',
   };
 
   const status = checkUserQuota(proUser, '2026-10-22');
   assert.equal(status.allowed, true);
   assert.equal(status.reason, 'pro_unlimited');
+});
+
+test('checkAndConsumeQuota enforces FREE limit and resets on new UTC day', () => {
+  const day1 = new Date('2026-10-22T10:00:00Z');
+  const day2 = new Date('2026-10-23T00:01:00Z');
+  const state: UserState = { tier: 'FREE', dailyRequestsCount: 19, lastRequestDate: day1 };
+
+  const res1 = checkAndConsumeQuota(state, day1, 20);
+  assert.equal(res1.allowed, true);
+  assert.equal(res1.newState.dailyRequestsCount, 20);
+
+  const res2 = checkAndConsumeQuota(res1.newState, day1, 20);
+  assert.equal(res2.allowed, false);
+
+  const res3 = checkAndConsumeQuota(res2.newState, day2, 20);
+  assert.equal(res3.allowed, true);
+  assert.equal(res3.newState.dailyRequestsCount, 1);
+});
+
+test('checkThrottle blocks rapid bursts within rateLimitMs window', () => {
+  const cache = new Map<number, number>();
+  const r1 = checkThrottle(999, 1000, cache, 500);
+  assert.equal(r1.throttled, false);
+
+  const r2 = checkThrottle(999, 1200, cache, 500);
+  assert.equal(r2.throttled, true);
+  assert.equal(r2.remainingMs, 300);
+
+  const r3 = checkThrottle(999, 1500, cache, 500);
+  assert.equal(r3.throttled, false);
 });

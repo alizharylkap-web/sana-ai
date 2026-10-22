@@ -33,11 +33,29 @@ export const ArchitectureView: React.FC = () => {
     setTimeout(() => setCopiedCode(null), 2000);
   };
 
-  const handleRunTests = () => {
+  const handleRunTests = async () => {
     setTestRunning(true);
-    setTimeout(() => {
-      setTestRunning(false);
-    }, 800);
+    try {
+      const res = await fetch('/api/run-tests', { method: 'POST' });
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.results)) {
+          setTestResults(
+            data.results.map((r: any) => ({
+              name: `${r.name} — ${r.details}`,
+              duration: r.durationMs,
+              passed: r.status === 'PASS',
+            }))
+          );
+        }
+      }
+    } catch {
+      // keep existing test list if offline
+    } finally {
+      setTimeout(() => {
+        setTestRunning(false);
+      }, 350);
+    }
   };
 
   return (

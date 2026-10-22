@@ -119,3 +119,73 @@ export function awardReferralBonus(referrer: UserQuotaState, bonusAmount = 10): 
     bonusQueries: referrer.bonusQueries + bonusAmount,
   };
 }
+
+export interface UserState {
+  tier: 'FREE' | 'PRO';
+  dailyRequestsCount: number;
+  lastRequestDate: Date;
+}
+
+/**
+ * Checks and consumes daily quota for UserState (used by Simulator and API test suite).
+ */
+export function checkAndConsumeQuota(
+  state: UserState,
+  now: Date,
+  limit = 20
+): { allowed: boolean; newState: UserState } {
+  const isNewDay =
+    state.lastRequestDate.getUTCFullYear() !== now.getUTCFullYear() ||
+    state.lastRequestDate.getUTCMonth() !== now.getUTCMonth() ||
+    state.lastRequestDate.getUTCDate() !== now.getUTCDate();
+
+  const currentCount = isNewDay ? 0 : state.dailyRequestsCount;
+
+  if (state.tier === 'PRO') {
+    return {
+      allowed: true,
+      newState: {
+        ...state,
+        dailyRequestsCount: currentCount + 1,
+        lastRequestDate: now,
+      },
+    };
+  }
+
+  if (currentCount >= limit) {
+    return {
+      allowed: false,
+      newState: {
+        ...state,
+        dailyRequestsCount: currentCount,
+        lastRequestDate: isNewDay ? now : state.lastRequestDate,
+      },
+    };
+  }
+
+  return {
+    allowed: true,
+    newState: {
+      ...state,
+      dailyRequestsCount: currentCount + 1,
+      lastRequestDate: now,
+    },
+  };
+}
+
+/**
+ * Sliding-window anti-spam rate limiter (ThrottlingMiddleware simulation).
+ */
+export function checkThrottle(
+  userId: number,
+  nowMs: number,
+  cache: Map<number, number>,
+  rateLimitMs = 500
+): { throttled: boolean; remainingMs: number } {
+  const lastMs = cache.get(userId);
+  if (lastMs !== undefined && nowMs - lastMs < rateLimitMs) {
+    return { throttled: true, remainingMs: rateLimitMs - (nowMs - lastMs) };
+  }
+  cache.set(userId, nowMs);
+  return { throttled: false, remainingMs: 0 };
+}
