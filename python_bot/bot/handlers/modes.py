@@ -14,10 +14,10 @@ from bot.models.user import User
 router = Router(name="modes_router")
 
 MODES = {
-    "mentor": "🧠 Ментор (Socratic)",
-    "coder": "💻 Программист (Senior Dev)",
+    "mentor": "🎓 Наставник (Socratic)",
+    "coder": "💻 Кодер (Senior Dev)",
     "planner": "📅 Планировщик (GTD)",
-    "examiner": "🎓 Экзаменатор (Strict)",
+    "examiner": "📝 Экзаменатор (Strict)",
     "editor": "✍️ Редактор (Copywriter)",
 }
 
@@ -41,7 +41,7 @@ def get_modes_keyboard(current_mode: str) -> InlineKeyboardMarkup:
 async def cmd_mode(message: Message, current_user: User, _: Callable) -> None:
     await message.answer(
         text=_("choose_mode"),
-        reply_markup=get_modes_keyboard(current_user.active_mode),
+        reply_markup=get_modes_keyboard(current_user.mode),
         parse_mode="HTML",
     )
 
@@ -58,11 +58,11 @@ async def process_mode_selection(
         await callback.answer("Неизвестный режим", show_alert=True)
         return
 
-    if new_mode == current_user.active_mode:
+    if new_mode == current_user.mode:
         await callback.answer("Этот режим уже активен!")
         return
 
-    current_user.active_mode = new_mode
+    current_user.mode = new_mode
     await db_session.commit()
 
     if callback.message:

@@ -29,7 +29,18 @@ def _build_engine(db_url: str) -> AsyncEngine:
             "pool_recycle": 1800,
             "pool_pre_ping": True,
         })
-    return create_async_engine(db_url, **kwargs)
+    try:
+        return create_async_engine(db_url, **kwargs)
+    except (ModuleNotFoundError, ImportError) as exc:
+        logger.warning(
+            "db_driver_missing_falling_back_to_sqlite",
+            error=str(exc),
+            fallback=config.SQLITE_FALLBACK_PATH,
+        )
+        return create_async_engine(
+            config.SQLITE_FALLBACK_PATH,
+            echo=(config.ENV == "development" and config.LOG_LEVEL == "DEBUG"),
+        )
 
 
 engine: AsyncEngine = _build_engine(config.database_url)

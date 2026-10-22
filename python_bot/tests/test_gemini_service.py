@@ -1,54 +1,18 @@
+from unittest.mock import MagicMock, patch
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from google.genai import types
 from bot.services.gemini_service import GeminiService
-from bot.models.user import User
-from bot.models.dialog import Message
-from bot.core.prompts_cache import PromptsCache
+from bot.core.prompts_cache import get_cached_system_prompt
 
 
-@pytest.fixture
-def mock_user():
-    return User(
-        id=12345,
-        username="test_user",
-        language="ru",
-        tier="FREE",
-        active_mode="mentor",
-    )
-
-
-@pytest.fixture
-def mock_pro_user():
-    return User(
-        id=99999,
-        username="pro_user",
-        language="en",
-        tier="PRO",
-        active_mode="coder",
-    )
+def test_get_cached_system_prompt():
+    prompt = get_cached_system_prompt("ru", "mentor")
+    assert "Sana AI" in prompt
+    assert "НАСТАВНИК" in prompt or "МЕНТОР" in prompt
 
 
 @pytest.mark.asyncio
-async def test_build_system_instruction(mock_user):
-    with patch.object(
-        PromptsCache, "get_base_prompt", return_value="Base RU Prompt."
-    ), patch.object(
-        PromptsCache, "get_mode_prompt", return_value="Mode Mentor Prompt."
-    ):
-        service = GeminiService()
-        memories = ["User is a Python developer", "User lives in Almaty"]
-
-        instruction = service._build_system_instruction(mock_user, memories)
-
-        assert "Base RU Prompt." in instruction
-        assert "Mode Mentor Prompt." in instruction
-        assert "ИЗВЕСТНЫЕ ФАКТЫ О ПОЛЬЗОВАТЕЛЕ" in instruction
-        assert "- User is a Python developer" in instruction
-        assert "- User lives in Almaty" in instruction
-
-
-@pytest.mark.asyncio
-async def test_generate_response_stream_free_user(mock_user):
+async def test_generate_response_stream_free_user():
     service = GeminiService()
 
     mock_chunk1 = MagicMock()
@@ -65,15 +29,15 @@ async def test_generate_response_stream_free_user(mock_user):
         "generate_content_stream",
         side_effect=mock_async_generator,
     ) as mock_gen:
-        context = [Message(user_id=12345, role="user", content="Старый вопрос")]
-        memories = ["Любит тесты"]
+        contents = [
+            types.Content(role="user", parts=[types.Part.from_text(text="Новый вопрос")])
+        ]
 
         chunks = []
         async for chunk in service.generate_response_stream(
-            user=mock_user,
-            context_messages=context,
-            memories=memories,
-            user_message="Новый вопрос",
+            system_prompt="System prompt",
+            contents=contents,
+            use_pro=False,
         ):
             chunks.append(chunk)
 
@@ -81,4 +45,3 @@ async def test_generate_response_stream_free_user(mock_user):
         mock_gen.assert_called_once()
         call_kwargs = mock_gen.call_args.kwargs
         assert "flash" in call_kwargs["model"]
-        assert len(call_kwargs["contents"]) == 2

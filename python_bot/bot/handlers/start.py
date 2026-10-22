@@ -1,6 +1,6 @@
 from typing import Callable
 from aiogram import Router, F
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -9,15 +9,17 @@ from aiogram.types import (
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bot.config import config
 from bot.models.user import User
+from bot.repositories.user_repo import UserRepository
 
 router = Router(name="start_router")
 
 MODE_LABELS = {
-    "mentor": "🧠 Ментор (Socratic)",
-    "coder": "💻 Программист (Senior Dev)",
+    "mentor": "🎓 Наставник (Socratic)",
+    "coder": "💻 Кодер (Senior Dev)",
     "planner": "📅 Планировщик (GTD)",
-    "examiner": "🎓 Экзаменатор (Strict)",
+    "examiner": "📝 Экзаменатор (Strict)",
     "editor": "✍️ Редактор (Copywriter)",
 }
 
@@ -41,7 +43,22 @@ def build_language_keyboard(current_lang: str) -> InlineKeyboardMarkup:
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, current_user: User, _: Callable) -> None:
+async def cmd_start(
+    message: Message,
+    command: CommandObject,
+    current_user: User,
+    user_repo: UserRepository,
+    db_session: AsyncSession,
+    _: Callable,
+) -> None:
+    if command.args and not current_user.referred_by_id:
+        ref_user = await user_repo.get_by_referral_code(command.args.strip())
+        if ref_user and ref_user.telegram_id != current_user.telegram_id:
+            current_user.referred_by_id = ref_user.telegram_id
+            ref_user.bonus_queries += config.REFERRAL_BONUS_QUERIES
+            ref_user.referral_count += 1
+            await db_session.commit()
+
     keyboard = build_language_keyboard(current_user.language)
     await message.answer(
         text=_("welcome"),
@@ -59,21 +76,32 @@ async def cmd_help(message: Message, _: Callable) -> None:
 
 
 @router.message(Command("profile", "status"))
-async def cmd_profile(message: Message, current_user: User, _: Callable) -> None:
-    tier_label = "💎 PRO (Unlim + Gemini 2.5 Pro)" if current_user.tier == "PRO" else "🆓 FREE (20 запросов/день)"
-    limit = 999999 if current_user.tier == "PRO" else 20
-    limit_str = "∞" if current_user.tier == "PRO" else str(limit)
-    mode_label = MODE_LABELS.get(current_user.active_mode, current_user.active_mode)
+async def cmd_profile(
+    message: Message,
+    current_user: User,
+    user_repo: UserRepository,
+    _: Callable,
+) -> None:
+    _, remaining = await user_repo.check_quota_precondition(current_user)
+    tier_label = (
+        "💎 Sana PRO (Безлимит + Gemini 2.5 Pro)"
+        if current_user.is_pro
+        else f"🆓 FREE ({config.FREE_DAILY_LIMIT} запросов/день)"
+    )
+    limit_str = "∞" if current_user.is_pro else str(config.FREE_DAILY_LIMIT + current_user.bonus_queries)
+    mode_label = MODE_LABELS.get(current_user.mode, current_user.mode)
 
     text = _(
         "profile_text",
-        user_id=current_user.id,
+        user_id=current_user.telegram_id,
         tier=tier_label,
-        used=current_user.daily_requests_count,
+        used=current_user.queries_used_today,
         limit=limit_str,
         mode=mode_label,
         lang=current_user.language.upper(),
     )
+    ref_link = f"https://t.me/{config.BOT_USERNAME}?start={current_user.referral_code}"
+    text += f"\n🎁 Бонусных запросов: <b>{current_user.bonus_queries}</b>\n🔗 Реферальная ссылка: <code>{ref_link}</code>"
     await message.answer(text=text, parse_mode="HTML")
 
 
@@ -91,7 +119,6 @@ async def process_lang_selection(
     callback: CallbackQuery,
     current_user: User,
     db_session: AsyncSession,
-    _: Callable,
 ) -> None:
     lang_code = callback.data.split(":", 1)[1]
     if lang_code not in ("ru", "kk", "en"):

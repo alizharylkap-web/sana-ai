@@ -22,17 +22,18 @@ async def cmd_export_history(
     )
 
     repo = DialogRepository(db_session)
-    messages = await repo.get_recent_context(current_user.id, limit=200)
-    memories = await repo.get_user_memories(current_user.id)
+    messages = await repo.get_recent_messages(current_user.telegram_id, limit=200)
+    memories = await repo.get_active_memories(current_user.telegram_id)
 
     if not messages and not memories:
         await status_msg.edit_text("📭 Ваша история диалогов пока пуста.")
         return
 
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    md_content = f"# 🧠 История диалогов с Sana AI\n"
-    md_content += f"**Пользователь:** {current_user.full_name or current_user.username or current_user.id}\n"
-    md_content += f"**Тариф:** {current_user.tier} | **Режим:** {current_user.active_mode}\n"
+    tier_str = "PRO" if current_user.is_pro else "FREE"
+    md_content = "# 🧠 История диалогов с Sana AI\n"
+    md_content += f"**Пользователь:** {current_user.first_name or current_user.username or current_user.telegram_id}\n"
+    md_content += f"**Тариф:** {tier_str} | **Режим:** {current_user.mode}\n"
     md_content += f"**Дата экспорта:** {now_str}\n\n"
     md_content += "---\n\n"
 
@@ -51,7 +52,7 @@ async def cmd_export_history(
     file_bytes = md_content.encode("utf-8")
     input_file = BufferedInputFile(
         file=file_bytes,
-        filename=f"sana_ai_history_{current_user.id}.md",
+        filename=f"sana_ai_history_{current_user.telegram_id}.md",
     )
 
     await message.answer_document(

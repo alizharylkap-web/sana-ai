@@ -1,19 +1,18 @@
 import html
 import io
-import logging
 from typing import Callable
 
 from aiogram import Router, F, Bot
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message
+from sqlalchemy.ext.asyncio import AsyncSession
+import structlog
 
-from bot.handlers.dialog import process_user_query_text
+from bot.handlers.dialog import process_user_query_text, gemini_service
 from bot.models.user import User
 from bot.repositories.user_repo import UserRepository
-from bot.services.gemini_service import gemini_service
-from sqlalchemy.ext.asyncio import AsyncSession
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 router = Router(name="voice_router")
 
 
@@ -26,9 +25,8 @@ async def handle_voice_message(
     db_session: AsyncSession,
     _: Callable,
 ) -> None:
-    # 1. Pre-check quota before transcribing
-    has_quota = await user_repo.check_quota_precondition(current_user)
-    if not has_quota:
+    allowed, _ = await user_repo.check_quota_precondition(current_user)
+    if not allowed:
         await message.answer(_("quota_exceeded"), parse_mode="HTML")
         return
 
@@ -56,15 +54,9 @@ async def handle_voice_message(
         audio_bytes = file_bytes_io.getvalue()
 
         mime_type = getattr(media, "mime_type", None) or "audio/ogg"
-        prompt = (
-            "Транскрибируй это голосовое сообщение максимально точно, без лишних слов и комментариев. "
-            "Верни только распознанный текст."
-        )
-        transcription = await gemini_service.analyze_media(
-            file_bytes=audio_bytes,
+        transcription = await gemini_service.transcribe_audio_bytes(
+            audio_bytes=audio_bytes,
             mime_type=mime_type,
-            prompt=prompt,
-            user=current_user,
         )
         transcription = (transcription or "").strip()
 
@@ -82,7 +74,6 @@ async def handle_voice_message(
             await status_msg.edit_text(f"🎙 Вы сказали:\n«{transcription}»", parse_mode=None)
 
         # Process recognized text through the shared dialog pipeline
-        # (Fixes the aiogram 3 frozen Message mutation bug and passes valid user_repo/db_session)
         await process_user_query_text(
             message=message,
             bot=bot,
@@ -94,5 +85,5 @@ async def handle_voice_message(
         )
 
     except Exception as e:
-        logger.error(f"Voice handling error for user {current_user.id}: {e}")
+        logger.error("voice_handling_error", user_id=current_user.telegram_id, error=str(e))
         await status_msg.edit_text("⚠️ Ошибка при обработке голосового сообщения.")

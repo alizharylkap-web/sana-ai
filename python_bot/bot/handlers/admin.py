@@ -1,25 +1,24 @@
 import asyncio
-import logging
-
 from aiogram import Router, Bot
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command
 from aiogram.types import Message
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
+import structlog
 
-from bot.config import settings
+from bot.config import config
 from bot.models.reminder import Reminder
 from bot.models.transaction import Transaction
 from bot.models.user import User
 from bot.repositories.user_repo import UserRepository
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 router = Router(name="admin_router")
 
 
-def is_admin(user_id: int) -> bool:
-    return user_id in settings.ADMIN_IDS
+def is_admin(user: User) -> bool:
+    return user.is_admin or (user.telegram_id in config.ADMIN_IDS)
 
 
 @router.message(Command("admin"))
@@ -28,32 +27,31 @@ async def cmd_admin_stats(
     current_user: User,
     db_session: AsyncSession,
 ) -> None:
-    if not is_admin(current_user.id):
+    if not is_admin(current_user):
         await message.answer("⛔ Доступ запрещён. Ваш ID не входит в список администраторов.")
         return
 
-    total_users = await db_session.scalar(select(func.count(User.id))) or 0
+    total_users = await db_session.scalar(select(func.count(User.telegram_id))) or 0
     pro_users = (
-        await db_session.scalar(select(func.count(User.id)).where(User.tier == "PRO"))
+        await db_session.scalar(select(func.count(User.telegram_id)).where(User.is_pro == True))  # noqa: E712
         or 0
     )
     banned_users = (
         await db_session.scalar(
-            select(func.count(User.id)).where(User.is_banned == True)
+            select(func.count(User.telegram_id)).where(User.is_banned == True)  # noqa: E712
         )
         or 0
     )
     active_reminders = (
         await db_session.scalar(
-            select(func.count(Reminder.id)).where(Reminder.is_completed == False)
+            select(func.count(Reminder.id)).where(Reminder.is_completed == False)  # noqa: E712
         )
         or 0
     )
     total_revenue_stars = (
         await db_session.scalar(
-            select(func.sum(Transaction.amount)).where(
-                Transaction.status == "SUCCESS",
-                Transaction.currency == "XTR",
+            select(func.sum(Transaction.amount_stars)).where(
+                Transaction.status == "successful"
             )
         )
         or 0
@@ -82,7 +80,7 @@ async def cmd_grant_pro(
     user_repo: UserRepository,
     db_session: AsyncSession,
 ) -> None:
-    if not is_admin(current_user.id):
+    if not is_admin(current_user):
         return
 
     args = message.text.split() if message.text else []
@@ -110,7 +108,7 @@ async def cmd_ban_user(
     user_repo: UserRepository,
     db_session: AsyncSession,
 ) -> None:
-    if not is_admin(current_user.id):
+    if not is_admin(current_user):
         return
 
     args = message.text.split() if message.text else []
@@ -138,7 +136,7 @@ async def cmd_unban_user(
     user_repo: UserRepository,
     db_session: AsyncSession,
 ) -> None:
-    if not is_admin(current_user.id):
+    if not is_admin(current_user):
         return
 
     args = message.text.split() if message.text else []
@@ -166,7 +164,7 @@ async def cmd_broadcast(
     current_user: User,
     user_repo: UserRepository,
 ) -> None:
-    if not is_admin(current_user.id):
+    if not is_admin(current_user):
         return
 
     args = message.text.split(maxsplit=1) if message.text else []
@@ -195,7 +193,7 @@ async def cmd_broadcast(
                 parse_mode="HTML",
             )
             sent_count += 1
-            await asyncio.sleep(0.05)  # FloodWait protection (20 msg/sec)
+            await asyncio.sleep(0.05)
         except TelegramRetryAfter as e:
             await asyncio.sleep(e.retry_after)
             try:
@@ -206,7 +204,7 @@ async def cmd_broadcast(
         except TelegramForbiddenError:
             failed_count += 1
         except Exception as e:
-            logger.warning(f"Failed to send broadcast to {uid}: {e}")
+            logger.warning("broadcast_send_failed", user_id=uid, error=str(e))
             failed_count += 1
 
     await status_msg.edit_text(

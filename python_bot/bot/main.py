@@ -1,6 +1,5 @@
 import asyncio
 from contextlib import asynccontextmanager
-import logging
 import sys
 
 from aiogram import Bot, Dispatcher
@@ -9,14 +8,14 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.types import BotCommand, Update
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Request, Header, HTTPException
 from sqlalchemy import text
+import structlog
 
-from bot.config import settings
+from bot.config import config
 from bot.core import database as db_core
-from bot.core.prompts_cache import PromptsCache
-from bot.core.redis import init_redis, close_redis, get_redis
+from bot.core.prompts_cache import load_prompts_cache
+from bot.core.redis import get_redis_client, close_redis
 from bot.handlers import (
     admin,
     billing,
@@ -31,17 +30,13 @@ from bot.handlers import (
 from bot.middlewares.auth_user import AuthUserMiddleware
 from bot.middlewares.i18n import I18nMiddleware
 from bot.middlewares.throttling import ThrottlingMiddleware
-from bot.services.reminder_service import reminder_service
+from bot.services.reminder_service import reminder_checker_loop
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
-scheduler = AsyncIOScheduler()
 bot: Bot | None = None
 dp: Dispatcher | None = None
+reminder_task: asyncio.Task | None = None
 
 
 async def setup_bot_commands(active_bot: Bot) -> None:
@@ -60,17 +55,15 @@ async def setup_bot_commands(active_bot: Bot) -> None:
     try:
         await active_bot.set_my_commands(commands)
     except Exception as e:
-        logger.warning(f"Could not set bot commands: {e}")
+        logger.warning("could_not_set_bot_commands", error=str(e))
 
 
 def create_dispatcher(redis_client=None) -> Dispatcher:
     storage = RedisStorage(redis=redis_client) if redis_client else MemoryStorage()
     dispatcher = Dispatcher(storage=storage)
 
-    # Register Middlewares (Order matters: Throttling -> Auth/DB -> I18n)
-    dispatcher.message.middleware(ThrottlingMiddleware(redis_client, rate_limit=0.8))
-    dispatcher.callback_query.middleware(ThrottlingMiddleware(redis_client, rate_limit=0.4))
-
+    # Register Middlewares (Throttling -> Auth/DB -> I18n)
+    dispatcher.message.middleware(ThrottlingMiddleware(redis_client, limit_per_sec=2.0))
     dispatcher.update.middleware(AuthUserMiddleware())
     dispatcher.update.middleware(I18nMiddleware())
 
@@ -90,52 +83,41 @@ def create_dispatcher(redis_client=None) -> Dispatcher:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global bot, dp
-    logger.info("Starting Sana AI Bot...")
+    global bot, dp, reminder_task
+    logger.info("starting_sana_ai_bot")
 
-    # 1. Initialize Database & Cache
     await db_core.init_db()
-    PromptsCache.load_prompts()
-    redis_client = await init_redis()
+    load_prompts_cache()
+    redis_client = await get_redis_client()
 
-    # 2. Initialize Bot & Dispatcher
+    token_str = config.BOT_TOKEN.get_secret_value()
     bot = Bot(
-        token=settings.BOT_TOKEN,
+        token=token_str,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = create_dispatcher(redis_client)
 
-    # 3. Start Background Scheduler
-    scheduler.add_job(
-        reminder_service.check_and_send_reminders,
-        trigger="interval",
-        seconds=30,
-        kwargs={"bot": bot},
-        id="check_reminders",
-        replace_existing=True,
-    )
-    scheduler.start()
+    reminder_task = asyncio.create_task(reminder_checker_loop(bot))
 
-    # 4. Set Webhook if configured
-    if settings.BOT_WEBHOOK_URL and settings.BOT_TOKEN != "0000000000:TEST_TOKEN_PLACEHOLDER":
-        webhook_url = f"{settings.BOT_WEBHOOK_URL.rstrip('/')}{settings.WEBHOOK_PATH}"
+    if config.BOT_WEBHOOK_URL and token_str != "0000000000:TEST_TOKEN_PLACEHOLDER":
+        webhook_url = f"{config.BOT_WEBHOOK_URL.rstrip('/')}{config.WEBHOOK_PATH}"
         await bot.set_webhook(
             url=webhook_url,
-            secret_token=settings.WEBHOOK_SECRET,
+            secret_token=config.WEBHOOK_SECRET,
             drop_pending_updates=True,
             allowed_updates=["message", "callback_query", "pre_checkout_query"],
         )
         await setup_bot_commands(bot)
-        logger.info(f"Webhook set to {webhook_url}")
+        logger.info("webhook_set", url=webhook_url)
 
     yield
 
-    logger.info("Shutting down Sana AI Bot...")
-    if scheduler.running:
-        scheduler.shutdown()
+    logger.info("shutting_down_sana_ai_bot")
+    if reminder_task:
+        reminder_task.cancel()
     if bot:
         try:
-            if settings.BOT_WEBHOOK_URL and settings.BOT_TOKEN != "0000000000:TEST_TOKEN_PLACEHOLDER":
+            if config.BOT_WEBHOOK_URL and token_str != "0000000000:TEST_TOKEN_PLACEHOLDER":
                 await bot.delete_webhook()
         except Exception:
             pass
@@ -147,13 +129,13 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Sana AI Webhook API", lifespan=lifespan)
 
 
-@app.post(settings.WEBHOOK_PATH)
+@app.post(config.WEBHOOK_PATH)
 async def bot_webhook(
     request: Request,
     x_telegram_bot_api_secret_token: str = Header(None),
 ):
-    if x_telegram_bot_api_secret_token != settings.WEBHOOK_SECRET:
-        logger.warning("Unauthorized webhook attempt detected!")
+    if config.WEBHOOK_SECRET and x_telegram_bot_api_secret_token != config.WEBHOOK_SECRET:
+        logger.warning("unauthorized_webhook_attempt")
         raise HTTPException(status_code=403, detail="Invalid secret token")
 
     if not bot or not dp:
@@ -174,16 +156,17 @@ async def health_check():
             await session.execute(text("SELECT 1"))
         health_status["db"] = "up"
     except Exception as e:
-        logger.error(f"Healthcheck DB error: {e}")
+        logger.error("healthcheck_db_error", error=str(e))
         health_status["status"] = "unhealthy"
 
     try:
-        redis_client = get_redis()
+        redis_client = await get_redis_client()
         if redis_client:
             await redis_client.ping()
             health_status["redis"] = "up"
-    except Exception as e:
-        logger.warning(f"Healthcheck Redis warning: {e}")
+        else:
+            health_status["redis"] = "fallback_memory"
+    except Exception:
         health_status["redis"] = "fallback_memory"
 
     if health_status["status"] == "unhealthy":
@@ -195,40 +178,32 @@ async def health_check():
 async def run_polling() -> None:
     """Run Sana AI Bot in Long-Polling mode (convenient for local dev or VPS without SSL)."""
     await db_core.init_db()
-    PromptsCache.load_prompts()
-    redis_client = await init_redis()
+    load_prompts_cache()
+    redis_client = await get_redis_client()
 
+    token_str = config.BOT_TOKEN.get_secret_value()
     active_bot = Bot(
-        token=settings.BOT_TOKEN,
+        token=token_str,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dispatcher = create_dispatcher(redis_client)
 
-    scheduler.add_job(
-        reminder_service.check_and_send_reminders,
-        trigger="interval",
-        seconds=30,
-        kwargs={"bot": active_bot},
-        id="check_reminders_polling",
-        replace_existing=True,
-    )
-    scheduler.start()
+    checker_task = asyncio.create_task(reminder_checker_loop(active_bot))
 
     try:
         await active_bot.delete_webhook(drop_pending_updates=True)
         await setup_bot_commands(active_bot)
-        logger.info("Sana AI Bot started in Long-Polling mode!")
+        logger.info("sana_ai_polling_started")
         await dispatcher.start_polling(active_bot)
     finally:
-        if scheduler.running:
-            scheduler.shutdown()
+        checker_task.cancel()
         await active_bot.session.close()
         await db_core.close_db()
         await close_redis()
 
 
 if __name__ == "__main__":
-    if settings.BOT_TOKEN == "0000000000:TEST_TOKEN_PLACEHOLDER":
-        logger.error("Please set a real BOT_TOKEN in .env before running polling!")
+    if config.BOT_TOKEN.get_secret_value() == "0000000000:TEST_TOKEN_PLACEHOLDER":
+        logger.error("please_set_real_bot_token_in_env")
         sys.exit(1)
     asyncio.run(run_polling())
