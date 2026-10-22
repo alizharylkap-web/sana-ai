@@ -1,0 +1,6 @@
+{
+  "name": "Sana AI — Production Telegram Bot & Web Platform",
+  "description": "Твой второй мозг для учёбы и работы. Telegram-бот на базе Google Gemini API с мультимодальностью, памятью, режимами и аналитикой.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
